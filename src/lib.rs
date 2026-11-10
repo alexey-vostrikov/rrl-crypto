@@ -170,6 +170,31 @@ impl Enctype {
     }
 
     /// The size of the derived checksum key `Kc` (RFC 3962 §5.3, RFC 8009 §5).
+    /// The enctype for a wire number, or an error naming the number.
+    ///
+    /// [`Enctype::from_id`] answers `Option`, which is the right shape inside this crate. This is
+    /// the shape a caller that has just read the number off the wire wants: the number belongs in
+    /// the message it produces.
+    pub fn from_i32(id: i32) -> Result<Self> {
+        Enctype::from_id(id).ok_or(Error::UnsupportedEnctype(id))
+    }
+
+    /// The wire enctype number. Same as [`Enctype::id`], under the name MIT and Heimdal use.
+    pub fn etype(self) -> i32 {
+        self.id()
+    }
+
+    /// The wire enctype number, for a caller that spells it `as_i32`.
+    pub fn as_i32(self) -> i32 {
+        self.id()
+    }
+
+    /// The long-term key size in octets. Same as [`Enctype::key_len`], under the name the
+    /// reference implementations use for the key a keytab stores.
+    pub fn key_size(self) -> usize {
+        self.key_len()
+    }
+
     /// `Ke` — the encryption key length (RFC 3961 §5.3). Same as [`Enctype::key_len`], under the
     /// name the RFC and both reference implementations use.
     pub fn ke_len(self) -> usize {
