@@ -289,27 +289,19 @@ fn pbkdf2(
 /// The constant string-to-key folds in after PBKDF2 (RFC 3962 §A.2).
 const S2K_CONSTANT: &[u8] = b"kerberos";
 
-/// RFC 3962 §A / RFC 8009 §4 string-to-key.
+/// The iteration count `s2kparams` asks for, refusing one below the enctype's default.
 ///
-/// `params` is the `s2kparams` octet string from the KDC's `ETYPE-INFO2`: four
-/// big-endian octets of iteration count, or absent for the enctype default.
-pub fn s2k(
-    enctype: Enctype,
-    password: &[u8],
-    salt: &[u8],
-    params: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let iterations = match params {
-        None | Some([]) => enctype.default_iterations(),
-        Some(p) if p.len() >= 4 => {
-            let v = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
-            if v == 0 || v > MAX_ITERATIONS {
-                return Err(Error::Crypto(format!(
-                    "s2kparams iteration count {v} out of range"
-                )));
-            }
-            v
-        }
+/// A KDC that sends `s2kparams` with a low count is asking for a key that falls to an offline
+/// dictionary attack in seconds, and the client has no way to tell that it happened: the key is
+/// the right length, the exchange succeeds, and the weakness surfaces only when someone with the
+/// ticket tries. Refusing is the only answer that reaches the operator.
+///
+/// `allow_weak` exists for the published vectors alone — RFC 3962 Appendix B and MIT's
+/// `crypto_tests` use counts like 1200 and 1, so a test that goes through `s2k` cannot run them.
+fn s2k_iterations(enctype: Enctype, params: Option<&[u8]>, allow_weak: bool) -> Result<u32> {
+    let count = match params {
+        None | Some([]) => return Ok(enctype.default_iterations()),
+        Some(p) if p.len() >= 4 => u32::from_be_bytes([p[0], p[1], p[2], p[3]]),
         Some(p) => {
             return Err(Error::Crypto(format!(
                 "s2kparams is {} octets, expected 4",
@@ -317,6 +309,56 @@ pub fn s2k(
             )));
         }
     };
+    if count > MAX_ITERATIONS {
+        return Err(Error::Crypto(format!(
+            "s2kparams iteration count {count} exceeds the {MAX_ITERATIONS} cap"
+        )));
+    }
+    let min = enctype.default_iterations();
+    if count < min && !allow_weak {
+        return Err(Error::Crypto(format!(
+            "s2kparams iteration count {count} is below the enctype's default of {min};              a key from it falls to an offline dictionary attack"
+        )));
+    }
+    Ok(count)
+}
+
+/// RFC 3962 §A / RFC 8009 §4 string-to-key.
+///
+/// `params` is the `s2kparams` octet string from the KDC's `ETYPE-INFO2`: four
+/// big-endian octets of iteration count, or absent for the enctype default. A count below the
+/// enctype's default is refused — see [`s2k_iterations`].
+pub fn s2k(
+    enctype: Enctype,
+    password: &[u8],
+    salt: &[u8],
+    params: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    s2k_with(enctype, password, salt, params, false)
+}
+
+/// [`s2k`] without the minimum-iteration refusal, for the published vectors.
+///
+/// RFC 3962 Appendix B and MIT's `crypto_tests` use iteration counts of 1200 and 1; those
+/// vectors are the reason the derivation can be checked against a third party at all, and they
+/// cannot pass through a function that refuses them. Nothing in a KDC path may call this.
+pub fn s2k_allow_weak(
+    enctype: Enctype,
+    password: &[u8],
+    salt: &[u8],
+    params: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    s2k_with(enctype, password, salt, params, true)
+}
+
+fn s2k_with(
+    enctype: Enctype,
+    password: &[u8],
+    salt: &[u8],
+    params: Option<&[u8]>,
+    allow_weak: bool,
+) -> Result<Vec<u8>> {
+    let iterations = s2k_iterations(enctype, params, allow_weak)?;
     let len = enctype.key_len();
     // RFC 8009 §4 replaces the salt with `enctype-name || 0x00 || salt`, so one
     // password and one salt give a different key per enctype. RFC 3962 has no
@@ -582,16 +624,66 @@ mod tests {
         ),
     ];
 
+    /// A low `s2kparams` count is refused, and the refusal names the count and the floor: the
+    /// operator needs to know what the KDC asked for, not merely that the key was not derived.
+    #[test]
+    fn a_low_iteration_count_is_refused() {
+        for count in [1u32, 1200, 4095] {
+            let err = s2k(
+                Enctype::Aes128Sha1,
+                b"password",
+                b"ATHENA.MIT.EDUraeburn",
+                Some(&count.to_be_bytes()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(&count.to_string()), "{err}");
+            assert!(
+                err.contains("4096"),
+                "the floor belongs in the message: {err}"
+            );
+        }
+        // The default, and anything above it, still derives.
+        for count in [4096u32, 5000] {
+            s2k(
+                Enctype::Aes128Sha1,
+                b"password",
+                b"ATHENA.MIT.EDUraeburn",
+                Some(&count.to_be_bytes()),
+            )
+            .expect("a count at or above the default derives");
+        }
+    }
+
+    /// The vectors and the strict path agree on the derivation, and differ only in whether a weak
+    /// count is allowed — so `s2k_allow_weak` is not a second implementation.
+    #[test]
+    fn the_weak_path_is_the_same_derivation() {
+        let params = 1200u32.to_be_bytes();
+        assert!(
+            s2k(Enctype::Aes128Sha1, b"p", b"s", Some(&params))
+                .unwrap_err()
+                .to_string()
+                .contains("1200")
+        );
+        let strong = 4096u32.to_be_bytes();
+        assert_eq!(
+            s2k(Enctype::Aes128Sha1, b"p", b"s", Some(&strong)).unwrap(),
+            s2k_allow_weak(Enctype::Aes128Sha1, b"p", b"s", Some(&strong)).unwrap()
+        );
+    }
+
     #[test]
     fn heimdal_s2k_vectors_sha1() {
         for (etype, password, salt, iterations, want) in S2K {
             let e = Enctype::from_id(*etype).unwrap();
             let params = iterations.to_be_bytes();
-            let got = s2k(e, password.as_bytes(), salt.as_bytes(), Some(&params)).unwrap();
+            let got =
+                s2k_allow_weak(e, password.as_bytes(), salt.as_bytes(), Some(&params)).unwrap();
             assert_eq!(
                 hex::encode(&got),
                 *want,
-                "s2k({password:?}, {salt:?}, {iterations}, etype {etype})"
+                "s2k_allow_weak({password:?}, {salt:?}, {iterations}, etype {etype})"
             );
         }
     }
@@ -601,7 +693,7 @@ mod tests {
     #[test]
     fn heimdal_s2k_with_binary_salt() {
         let salt = [0x12, 0x34, 0x56, 0x78, 0x78, 0x56, 0x34, 0x12];
-        let got = s2k(
+        let got = s2k_allow_weak(
             Enctype::Aes128Sha1,
             b"password",
             &salt,
@@ -609,7 +701,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hex::encode(&got), "e9b23d52273747dd5c35cb55be619d8e");
-        let got = s2k(
+        let got = s2k_allow_weak(
             Enctype::Aes256Sha1,
             b"password",
             &salt,

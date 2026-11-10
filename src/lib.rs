@@ -367,6 +367,22 @@ pub trait Cipher: std::fmt::Debug + Send + Sync {
         params: Option<&[u8]>,
     ) -> Result<Key>;
 
+    /// [`Cipher::s2k`] without the minimum-iteration refusal, for published vectors.
+    ///
+    /// RFC 3962 Appendix B and MIT's `crypto_tests` derive with iteration counts of 1 and 1200,
+    /// so a test that compares against them cannot go through the strict path. The default
+    /// forwards to [`Cipher::s2k`] — a backend that has no separate strict path is not thereby
+    /// weakened, it simply never refused.
+    fn s2k_allow_weak(
+        &self,
+        enctype: Enctype,
+        password: &[u8],
+        salt: &[u8],
+        params: Option<&[u8]>,
+    ) -> Result<Key> {
+        self.s2k(enctype, password, salt, params)
+    }
+
     /// The usage-specific key (DR/DK for 17/18, KDF-HMAC-SHA2 for 19/20).
     fn derive_key(
         &self,
@@ -438,6 +454,19 @@ impl Cipher for OwnCipher {
         params: Option<&[u8]>,
     ) -> Result<Key> {
         Key::new(enctype, kdf::s2k(enctype, password, salt, params)?)
+    }
+
+    fn s2k_allow_weak(
+        &self,
+        enctype: Enctype,
+        password: &[u8],
+        salt: &[u8],
+        params: Option<&[u8]>,
+    ) -> Result<Key> {
+        Key::new(
+            enctype,
+            kdf::s2k_allow_weak(enctype, password, salt, params)?,
+        )
     }
 
     fn derive_key(

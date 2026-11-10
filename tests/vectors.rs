@@ -268,8 +268,11 @@ fn mit_string_to_key_vectors() {
                 continue;
             }
             let params = (!t.params.is_empty()).then(|| hex::decode(&t.params).unwrap());
+            // The weak path, because these vectors are MIT's and several use an iteration count
+            // an operator would never choose. Comparing against them is the only way to know the
+            // derivation is MIT's; a strict path is checked separately, in `kdf`'s own tests.
             let got = backend
-                .s2k(
+                .s2k_allow_weak(
                     e,
                     &hex::decode(&t.password).unwrap(),
                     &hex::decode(&t.salt).unwrap(),
@@ -335,8 +338,9 @@ fn string_to_key_vectors() {
             let password = hex::decode(&t.password_hex).unwrap();
             let salt = hex::decode(&t.salt).unwrap();
             let params = t.iterations.to_be_bytes();
+            // Heimdal's vectors include counts of 1 and 5; the strict path refuses those.
             let got = backend
-                .s2k(e, &password, &salt, Some(&params))
+                .s2k_allow_weak(e, &password, &salt, Some(&params))
                 .unwrap_or_else(|err| panic!("[{}] s2k #{i} failed: {err}", backend.name()));
             assert_eq!(
                 hex::encode(got.bytes()),
