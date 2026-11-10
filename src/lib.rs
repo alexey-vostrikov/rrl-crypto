@@ -1,14 +1,30 @@
-//! Kerberos cryptography: RFC 3961, 3962 and 8009, and nothing else.
+//! The cryptography of RRL, in one place.
 //!
-//! The primitives are RustCrypto's (`aes`, `hmac`, `sha1`, `sha2`, `md-5`); what this crate adds
-//! is the Kerberos profile over them — the DR/DK derivation, n-fold, the string-to-key
-//! constructions with their salts and iteration counts, AES in CBC-CS3, and the key-usage
-//! numbering that decides which derived key encrypts and which authenticates.
+//! `rrl` is a Kerberos KDC that speaks LDAP and SMB, and all three need cryptography that
+//! interoperates with someone else's implementation: a KDC has to agree with every client, a
+//! directory with every LDAP client, an SMB server with Windows. The rule for what belongs here
+//! is therefore *who needs it*, not which RFC it is written in — one copy of each construction,
+//! consumed by everything in the project.
 //!
-//! Extracted from `rust-kdc` so that one implementation serves both sides of the protocol: a KDC
-//! and a client have to agree byte for byte on every one of these, and two copies of them are two
-//! ways to disagree. The extraction is deliberately narrow — no sockets, no clocks, no caches, no
-//! `chrono` — because the crate it came from is sans-io and must stay that way.
+//! The primitives are RustCrypto's; what this crate adds is the constructions:
+//!
+//! * Kerberos (`kdf`, `nfold`, `aes_cts`, `profile`) — DR/DK, n-fold, the string-to-key
+//!   constructions with their salts and iteration counts, AES in CBC-CS3, the RFC 3961 §5.3
+//!   profile, and the key-usage numbering that decides which derived key encrypts and which
+//!   authenticates;
+//! * `checksum` — the keyed checksums a protocol names by number, starting with
+//!   `KERB_CHECKSUM_HMAC_MD5`, which the PAC and S4U both need and which used to exist twice.
+//!
+//! No sockets, no clocks, no caches, no `chrono`: the crates that consume this one are sans-io and
+//! must stay that way.
+//!
+//! # One line of RustCrypto, deliberately
+//!
+//! A project that pulls `aes` once through one dependency and once through another ends up with
+//! two of them linked into the same binary. That is not a size problem — it is an audit problem:
+//! a fix has to reach every line, and nothing fails when it reaches only one. This crate and the
+//! SMB server that consumes it therefore sit on the same versions of `aes`, `hmac`, `sha2`,
+//! `digest` and `cipher`, and a test asserts the tree carries one of each.
 //!
 //! # Two backends
 //!
@@ -25,6 +41,7 @@
 //! tables are external and the differential run is how they are used.
 
 pub mod aes_cts;
+pub mod checksum;
 pub mod error;
 pub mod kdf;
 pub mod nfold;
