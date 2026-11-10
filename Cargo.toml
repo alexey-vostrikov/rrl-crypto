@@ -1,0 +1,49 @@
+[package]
+name = "rrl-crypto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "Kerberos cryptography: RFC 3961 DR/DK and n-fold, RFC 3962 and RFC 8009 enctypes, behind a backend trait two implementations can be checked against"
+license = "MIT"
+readme = "README.md"
+keywords = ["kerberos", "krb5", "crypto", "rfc3961", "rfc8009"]
+categories = ["authentication", "cryptography"]
+
+[dependencies]
+# The primitives. Everything Kerberos-specific — the profile, the derivations, the key-usage
+# numbering — is this crate's own, because no general-purpose crypto library exposes it: TLS wants
+# AEAD, Kerberos wants AES-CBC-CS3 with DR/DK-derived keys and truncated HMAC.
+aes = "0.9"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+md-5 = "0.11"
+# Randomness for session keys and confounders. `getrandom` rather than `rand`: this layer only
+# needs bytes from the OS, and the caller decides nothing about them.
+getrandom = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# The second backend, off by default: a third-party implementation of the same RFCs, present so
+# that every vector is checked by two independent pieces of code rather than by one.
+rskrb5 = { version = "0.2", default-features = false, optional = true }
+# `Enctype` as a JSON number, for a control plane that lists allowed enctypes.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+# The vectors are MIT's and Heimdal's, kept as JSON so the table is a file a reviewer can diff
+# against the RFC rather than an array buried in a test.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# A third party's implementation of the same RFCs, for the agreement test: if its `Key` opened
+# MIT's ciphertexts the way ours does, the two agreed, and that was worth knowing before deciding
+# not to reuse it. Kept so a drift in either direction is visible.
+krb5 = "1.0"
+
+[features]
+default = []
+# The differential run: `cargo test --features crypto-rskrb5`.
+crypto-rskrb5 = ["dep:rskrb5"]
+# Serialise `Enctype` by its RFC number, the way every `krb5.conf` spells it.
+serde = ["dep:serde"]
