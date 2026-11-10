@@ -28,6 +28,7 @@ pub mod aes_cts;
 pub mod error;
 pub mod kdf;
 pub mod nfold;
+pub mod profile;
 
 #[cfg(feature = "crypto-rskrb5")]
 pub mod rskrb5_backend;
@@ -169,6 +170,32 @@ impl Enctype {
     }
 
     /// The size of the derived checksum key `Kc` (RFC 3962 §5.3, RFC 8009 §5).
+    /// `Ke` — the encryption key length (RFC 3961 §5.3). Same as [`Enctype::key_len`], under the
+    /// name the RFC and both reference implementations use.
+    pub fn ke_len(self) -> usize {
+        self.key_len()
+    }
+
+    /// `Ki` — the integrity key length (RFC 3961 §5.3).
+    pub fn ki_len(self) -> usize {
+        self.integrity_key_len()
+    }
+
+    /// `Kc` — the checksum key length (RFC 3961 §5.3).
+    pub fn kc_len(self) -> usize {
+        self.checksum_key_len()
+    }
+
+    /// Whether this enctype uses the RFC 8009 profile, where the MAC covers `IV | C`.
+    pub fn is_rfc8009(self) -> bool {
+        self.sha2_kind().is_some()
+    }
+
+    /// What the profile adds to a plaintext: the confounder and the MAC.
+    pub fn overhead(self) -> usize {
+        self.confounder_len() + self.mac_len()
+    }
+
     pub fn checksum_key_len(self) -> usize {
         self.integrity_key_len()
     }
@@ -374,7 +401,7 @@ impl Cipher for OwnCipher {
 
     fn random(&self, enctype: Enctype) -> Result<Key> {
         let mut bytes = vec![0u8; enctype.key_len()];
-        getrandom::fill(&mut bytes).map_err(|e| Error::Crypto(format!("getrandom: {e}")))?;
+        getrandom::fill(&mut bytes).map_err(|e| Error::crypto(format!("getrandom: {e}")))?;
         Key::new(enctype, bytes)
     }
 
@@ -399,9 +426,8 @@ impl Cipher for OwnCipher {
     }
 
     fn encrypt(&self, key: &Key, usage: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut confounder = vec![0u8; key.enctype().confounder_len()];
-        getrandom::fill(&mut confounder).map_err(|e| Error::Crypto(format!("getrandom: {e}")))?;
-        self.encrypt_with_confounder(key, usage, plaintext, &confounder)
+        let (ke, ki) = self.parts(key, usage)?;
+        profile::encrypt(key.enctype(), &ke, &ki, plaintext)
     }
 
     fn encrypt_with_confounder(
@@ -411,122 +437,38 @@ impl Cipher for OwnCipher {
         plaintext: &[u8],
         confounder: &[u8],
     ) -> Result<Vec<u8>> {
-        let e = key.enctype();
-        if confounder.len() != e.confounder_len() {
-            return Err(Error::Crypto(format!(
-                "confounder is {} octets, {} needs {}",
-                confounder.len(),
-                e.name(),
-                e.confounder_len()
-            )));
-        }
-        let mut plain = Vec::with_capacity(confounder.len() + plaintext.len());
-        plain.extend_from_slice(confounder);
-        plain.extend_from_slice(plaintext);
-
-        let ke = kdf::derive_key(e, key.bytes(), usage, KeyUse::Encrypt)?;
-        let ki = kdf::derive_key(e, key.bytes(), usage, KeyUse::Integrity)?;
-        let zero_iv = [0u8; AES_BLOCK];
-
-        match e.sha2_kind() {
-            // RFC 3961 §5.3: the MAC covers the plaintext and follows it.
-            None => {
-                let mut out = aes_cts::encrypt(&ke, &zero_iv, &plain)?;
-                let tag = hmac_by(e, &ki, &plain)?;
-                out.extend_from_slice(&tag[..e.mac_len()]);
-                Ok(out)
-            }
-            // RFC 8009 §5: the MAC covers `IV | C`, so it can be checked
-            // before decrypting.
-            Some(_) => {
-                let cipher = aes_cts::encrypt(&ke, &zero_iv, &plain)?;
-                let mut macced = Vec::with_capacity(AES_BLOCK + cipher.len());
-                macced.extend_from_slice(&zero_iv);
-                macced.extend_from_slice(&cipher);
-                let tag = hmac_by(e, &ki, &macced)?;
-                let mut out = cipher;
-                out.extend_from_slice(&tag[..e.mac_len()]);
-                Ok(out)
-            }
-        }
+        let (ke, ki) = self.parts(key, usage)?;
+        profile::encrypt_with_confounder(key.enctype(), &ke, &ki, confounder, plaintext)
     }
 
     fn decrypt(&self, key: &Key, usage: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let e = key.enctype();
-        let mac_len = e.mac_len();
-        if ciphertext.len() < AES_BLOCK + mac_len {
-            return Err(Error::Crypto(format!(
-                "ciphertext is {} octets; {} needs at least {}",
-                ciphertext.len(),
-                e.name(),
-                AES_BLOCK + mac_len
-            )));
-        }
-        let (cipher, tag) = ciphertext.split_at(ciphertext.len() - mac_len);
-        let ke = kdf::derive_key(e, key.bytes(), usage, KeyUse::Encrypt)?;
-        let ki = kdf::derive_key(e, key.bytes(), usage, KeyUse::Integrity)?;
-        let zero_iv = [0u8; AES_BLOCK];
-
-        let plain = match e.sha2_kind() {
-            None => {
-                let plain = aes_cts::decrypt(&ke, &zero_iv, cipher)?;
-                let expect = hmac_by(e, &ki, &plain)?;
-                if !ct_eq(&expect[..mac_len], tag) {
-                    return Err(Error::Crypto("integrity check failed".into()));
-                }
-                plain
-            }
-            Some(_) => {
-                let mut macced = Vec::with_capacity(AES_BLOCK + cipher.len());
-                macced.extend_from_slice(&zero_iv);
-                macced.extend_from_slice(cipher);
-                let expect = hmac_by(e, &ki, &macced)?;
-                if !ct_eq(&expect[..mac_len], tag) {
-                    return Err(Error::Crypto("integrity check failed".into()));
-                }
-                aes_cts::decrypt(&ke, &zero_iv, cipher)?
-            }
-        };
-
-        if plain.len() < e.confounder_len() {
-            return Err(Error::Crypto(
-                "decrypted plaintext is shorter than the confounder".into(),
-            ));
-        }
-        Ok(plain[e.confounder_len()..].to_vec())
+        let (ke, ki) = self.parts(key, usage)?;
+        profile::decrypt(key.enctype(), &ke, &ki, ciphertext)
     }
 
     fn checksum(&self, key: &Key, usage: u32, data: &[u8]) -> Result<Vec<u8>> {
         let kc = kdf::derive_key(key.enctype(), key.bytes(), usage, KeyUse::Checksum)?;
-        let tag = hmac_by(key.enctype(), &kc, data)?;
-        Ok(tag[..key.enctype().mac_len()].to_vec())
+        profile::checksum(key.enctype(), &kc, data)
+    }
+
+    fn verify_checksum(&self, key: &Key, usage: u32, data: &[u8], tag: &[u8]) -> Result<()> {
+        let kc = kdf::derive_key(key.enctype(), key.bytes(), usage, KeyUse::Checksum)?;
+        profile::verify_checksum(key.enctype(), &kc, data, tag)
     }
 }
 
-fn hmac_by(enctype: Enctype, key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha1::Sha1;
-    use sha2::{Sha256, Sha384};
-    Ok(match enctype.sha2_kind() {
-        None => {
-            let mut m = <Hmac<Sha1> as KeyInit>::new_from_slice(key)
-                .map_err(|_| Error::Crypto("HMAC-SHA1 key".into()))?;
-            m.update(msg);
-            m.finalize().into_bytes().to_vec()
-        }
-        Some(Sha2Kind::Sha256) => {
-            let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
-                .map_err(|_| Error::Crypto("HMAC-SHA256 key".into()))?;
-            m.update(msg);
-            m.finalize().into_bytes().to_vec()
-        }
-        Some(Sha2Kind::Sha384) => {
-            let mut m = <Hmac<Sha384> as KeyInit>::new_from_slice(key)
-                .map_err(|_| Error::Crypto("HMAC-SHA384 key".into()))?;
-            m.update(msg);
-            m.finalize().into_bytes().to_vec()
-        }
-    })
+impl OwnCipher {
+    /// The `Ke`/`Ki` for `usage`, which the profile takes as arguments.
+    ///
+    /// Derived here rather than in the profile because that layer is also used by callers that
+    /// already hold the derived keys (a TGS reply derives once and seals several structures).
+    fn parts(&self, key: &Key, usage: u32) -> Result<(Vec<u8>, Vec<u8>)> {
+        let e = key.enctype();
+        Ok((
+            kdf::derive_key(e, key.bytes(), usage, KeyUse::Encrypt)?,
+            kdf::derive_key(e, key.bytes(), usage, KeyUse::Integrity)?,
+        ))
+    }
 }
 
 /// Constant-time equality for tags and keys.
