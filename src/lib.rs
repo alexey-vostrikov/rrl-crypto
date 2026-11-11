@@ -678,4 +678,44 @@ mod tests {
         let key = c.random(Enctype::Aes128Sha1).unwrap();
         assert!(c.encrypt_with_confounder(&key, 3, b"x", &[0u8; 8]).is_err());
     }
+
+    /// Four consumers compared secrets by hand before this had a test of its own: a secure
+    /// channel's credential, an SMB2 signature, an NTLM proof and a Kerberos checksum. One of the
+    /// four got the length check wrong at some point, so the behaviour is pinned here rather than
+    /// assumed.
+    #[test]
+    fn a_comparison_is_equal_only_when_every_octet_is() {
+        assert!(ct_eq(b"", b""), "two empty slices hold the same nothing");
+        assert!(ct_eq(b"secret", b"secret"));
+
+        // Every position, not one: an implementation that skipped the last octet - the one a
+        // length-and-prefix comparison would skip - passes a single-position test written at the
+        // front.
+        let a = b"the value being compared";
+        for index in 0..a.len() {
+            let mut b = a.to_vec();
+            b[index] ^= 0x01;
+            assert!(
+                !ct_eq(a, &b),
+                "octet {index} of {} was not compared",
+                a.len()
+            );
+        }
+    }
+
+    /// A shorter value is not a prefix of a longer one.
+    #[test]
+    fn a_difference_in_length_is_a_difference() {
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(!ct_eq(b"secre", b"secret"));
+        assert!(
+            !ct_eq(b"", b"secret"),
+            "the empty value must not match a non-empty one"
+        );
+        assert!(!ct_eq(b"secret", b""));
+        // Same prefix, same length difference, other order: a comparison that returns the result of
+        // the length check without looking at the contents gets this one right by accident and the
+        // one above wrong.
+        assert!(!ct_eq(b"secret ", b"secret"));
+    }
 }
