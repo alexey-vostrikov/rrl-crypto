@@ -45,6 +45,7 @@ pub mod checksum;
 pub mod error;
 pub mod kdf;
 pub mod nfold;
+pub mod nt;
 pub mod profile;
 
 #[cfg(feature = "crypto-rskrb5")]

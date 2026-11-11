@@ -18,6 +18,9 @@ hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 md-5 = "0.11"
+# The NT hash of a Windows account (MS-NLMP 3.3.1), which a secure channel is checked against.
+# Not a password hash in the modern sense: plain MD4, defined by the wire protocol.
+md4   = "0.10"
 # Randomness for session keys and confounders. `getrandom` rather than `rand`: this layer only
 # needs bytes from the OS, and the caller decides nothing about them.
 getrandom = "0.4"
