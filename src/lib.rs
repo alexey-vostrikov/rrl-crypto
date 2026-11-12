@@ -633,7 +633,18 @@ impl OwnCipher {
     }
 }
 
-/// Constant-time equality for tags and keys.
+/// The plain MD5 digest of `data`.
+///
+/// Exposed for the callers that must reproduce a checksum a client computed by hand; the RFC 3961
+/// path goes through [`Key`] and never calls this directly.
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    use md5::{Digest, Md5};
+    let mut digest = Md5::new();
+    digest.update(data);
+    digest.finalize().into()
+}
+
+/// Whether two slices are equal, in constant time.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
