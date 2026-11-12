@@ -370,6 +370,26 @@ impl Key {
         Ok(Key { enctype, bytes })
     }
 
+    /// The `rsa-md5` checksum (type 7) over `message`, keyed with this key.
+    ///
+    /// Not an RFC 3961 profile checksum: it is MD5 over the key followed by the data, which is what
+    /// MIT and Heimdal compute, and it can be used with a key of any enctype. Windows sends exactly
+    /// this for the body of a `TGS-REQ` even when the TGT's session key is AES, so a KDC that accepts
+    /// only the enctype's own checksum refuses every service ticket from a Windows client after
+    /// issuing it a perfectly good TGT.
+    pub fn rsa_md5_checksum(&self, message: &[u8]) -> [u8; 16] {
+        use md5::{Digest, Md5};
+        let mut digest = Md5::new();
+        digest.update(&self.bytes);
+        digest.update(message);
+        digest.finalize().into()
+    }
+
+    /// Whether `tag` is the `rsa-md5` checksum of `message` under this key.
+    pub fn verify_rsa_md5_checksum(&self, message: &[u8], tag: &[u8]) -> bool {
+        ct_eq(&self.rsa_md5_checksum(message), tag)
+    }
+
     /// The enctype these octets are a key for.
     pub fn enctype(&self) -> Enctype {
         self.enctype
@@ -628,6 +648,24 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsa_md5_is_keyed_the_way_a_windows_client_keys_it() {
+        // Type 7 is MD5 over the key followed by the data, not a derived profile checksum. The vector
+        // is computed independently (`md5("key" || "data")`), so a change to the construction - adding
+        // a length, deriving a key, swapping the order - fails here rather than in a domain join.
+        let key =
+            Key::new(Enctype::Aes128Sha1, (0u8..16).collect::<Vec<_>>()).expect("a 16-octet key");
+        assert_eq!(
+            key.rsa_md5_checksum(b"data"),
+            [
+                0x27, 0x23, 0xa0, 0xbb, 0xc6, 0x0b, 0xf2, 0x9b, 0xf2, 0xdd, 0x30, 0xdd, 0x96, 0x23,
+                0xc8, 0x04
+            ]
+        );
+        assert!(key.verify_rsa_md5_checksum(b"data", &key.rsa_md5_checksum(b"data")));
+        assert!(!key.verify_rsa_md5_checksum(b"other", &key.rsa_md5_checksum(b"data")));
+    }
 
     #[test]
     fn enctype_table_is_self_consistent() {
