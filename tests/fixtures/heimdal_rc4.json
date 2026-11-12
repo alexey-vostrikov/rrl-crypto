@@ -1,0 +1,25 @@
+{
+  "note": "Produced by scripts/heimdal-rc4-vectors.sh against Heimdal 7.7 (Debian bullseye, heimdal-dev). heimdal: what Heimdal encrypted with its own confounder. ours: what rrl-crypto encrypted with the fixed confounder, which Heimdal then decrypted back to the plaintext recorded in heimdal_read_ours_as.",
+  "keys": [
+    { "password": "50617373776f726431323321", "salt": "4558414d504c452e434f4d616c696365", "key": "2b576acbe6bcfda7294d6bd18041b8fe" },
+    { "password": "70c3a4737377c3b67264", "salt": "4558414d504c452e434f4d616c696365", "key": "0553152250ac01adb4213cb9938663e4" }
+  ],
+  "cases": [
+    {
+      "key": "2b576acbe6bcfda7294d6bd18041b8fe", "usage": 3,
+      "plaintext": "74686520656e637279707465642070617274206f6620616e2041532d524550",
+      "heimdal": "262198ddb60e4772dd871aafd429b79643e7efd57d3db50fdb0c59cda58f04803e9488094eea747b499a812829349cb34adc7fc62d4b73",
+      "ours_confounder": "0001020304050607",
+      "ours": "6fa141c1d31a562c024382b53a47c38e19ae08befc4fab84eadc0a6069d126056be2a3e8cacf60fcb140a4e87ac04419776778da05f412",
+      "heimdal_read_ours_as": "74686520656e637279707465642070617274206f6620616e2041532d524550"
+    },
+    {
+      "key": "2b576acbe6bcfda7294d6bd18041b8fe", "usage": 1,
+      "plaintext": "612050412d454e432d54494d455354414d50",
+      "heimdal": "1c65dc9b2749f458ebb276b32ba2d7f97149573781477c195bae9d4dc5dac6342042021c770e4def9a5b",
+      "ours_confounder": "0001020304050607",
+      "ours": "28e2512f50fe5bd1a1084aa0640202aebb7c1393450fe036b6967652ead6d9d627ab61d6562001be6cdd",
+      "heimdal_read_ours_as": "612050412d454e432d54494d455354414d50"
+    }
+  ]
+}

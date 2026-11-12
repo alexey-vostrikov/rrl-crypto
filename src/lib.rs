@@ -47,6 +47,7 @@ pub mod kdf;
 pub mod nfold;
 pub mod nt;
 pub mod profile;
+pub mod rc4; // rc4-hmac (enctype 23), RFC 4757: the one envelope that is not RFC 3961's
 
 #[cfg(feature = "crypto-rskrb5")]
 pub mod rskrb5_backend;
@@ -74,6 +75,11 @@ pub enum Enctype {
     Aes128Sha256 = 19,
     /// `aes256-cts-hmac-sha384-192` (RFC 8009).
     Aes256Sha384 = 20,
+    /// `rc4-hmac` (RFC 4757): weak, and needed to accept a key or a ticket that carries it.
+    ///
+    /// Not in [`Enctype::ALL`], so a realm never offers it unless its configuration says so. Its
+    /// envelope is not RFC 3961's — see [`crate::rc4`].
+    Rc4Hmac = 23,
 }
 
 #[cfg(feature = "serde")]
@@ -119,6 +125,7 @@ impl Enctype {
             18 => Some(Enctype::Aes256Sha1),
             19 => Some(Enctype::Aes128Sha256),
             20 => Some(Enctype::Aes256Sha384),
+            23 => Some(Enctype::Rc4Hmac),
             _ => None,
         }
     }
@@ -130,6 +137,10 @@ impl Enctype {
             "aes256-cts-hmac-sha1-96" | "aes256-sha1" | "aes-256" => Some(Enctype::Aes256Sha1),
             "aes128-cts-hmac-sha256-128" | "aes128-sha2" => Some(Enctype::Aes128Sha256),
             "aes256-cts-hmac-sha384-192" | "aes256-sha2" => Some(Enctype::Aes256Sha384),
+            // Heimdal's alias and MIT's, both of which appear in real `krb5.conf` files.
+            "rc4-hmac" | "arcfour-hmac" | "arcfour-hmac-md5" | "rc4-hmac-md5" => {
+                Some(Enctype::Rc4Hmac)
+            }
             _ => None,
         }
     }
@@ -146,6 +157,7 @@ impl Enctype {
             Enctype::Aes256Sha1 => "aes256-cts-hmac-sha1-96",
             Enctype::Aes128Sha256 => "aes128-cts-hmac-sha256-128",
             Enctype::Aes256Sha384 => "aes256-cts-hmac-sha384-192",
+            Enctype::Rc4Hmac => "rc4-hmac",
         }
     }
 
@@ -154,6 +166,7 @@ impl Enctype {
         match self {
             Enctype::Aes128Sha1 | Enctype::Aes128Sha256 => 16,
             Enctype::Aes256Sha1 | Enctype::Aes256Sha384 => 32,
+            Enctype::Rc4Hmac => 16,
         }
     }
 
@@ -161,7 +174,11 @@ impl Enctype {
     /// RFC 8009 §5).
     /// The confounder length: one cipher block for every enctype.
     pub fn confounder_len(self) -> usize {
-        AES_BLOCK
+        match self {
+            // Eight octets, not a cipher block: RC4 has no block, and RFC 4757 §7.2 fixes eight.
+            Enctype::Rc4Hmac => crate::rc4::CONFOUNDER_LEN,
+            _ => AES_BLOCK,
+        }
     }
 
     /// Truncated MAC length (RFC 3962 §6, RFC 8009 §6).
@@ -170,6 +187,7 @@ impl Enctype {
             Enctype::Aes128Sha1 | Enctype::Aes256Sha1 => 12,
             Enctype::Aes128Sha256 => 16,
             Enctype::Aes256Sha384 => 24,
+            Enctype::Rc4Hmac => 16,
         }
     }
 
@@ -185,6 +203,14 @@ impl Enctype {
             Enctype::Aes256Sha384 => 24,
             other => other.key_len(),
         }
+    }
+
+    /// Whether this enctype's envelope is RFC 4757's rather than RFC 3961's.
+    ///
+    /// One enctype, and the distinction has to be visible: the offsets differ, the tag comes first,
+    /// and the usage number is mapped before it is used.
+    pub fn is_rc4(self) -> bool {
+        matches!(self, Enctype::Rc4Hmac)
     }
 
     /// The size of the derived checksum key `Kc` (RFC 3962 §5.3, RFC 8009 §5).
@@ -250,6 +276,8 @@ impl Enctype {
             Enctype::Aes256Sha1 => 16,   // hmac-sha1-96-aes256
             Enctype::Aes128Sha256 => 19, // hmac-sha256-128-aes128
             Enctype::Aes256Sha384 => 20, // hmac-sha384-192-aes256
+            // `hmac-md5-rc4`: negative, and that is the number on the wire.
+            Enctype::Rc4Hmac => crate::rc4::CHECKSUM_TYPE,
         }
     }
 
@@ -259,6 +287,8 @@ impl Enctype {
             Enctype::Aes128Sha1 | Enctype::Aes256Sha1 => None,
             Enctype::Aes128Sha256 => Some(Sha2Kind::Sha256),
             Enctype::Aes256Sha384 => Some(Sha2Kind::Sha384),
+            // Neither family: RFC 4757 predates both, and its profile is its own.
+            Enctype::Rc4Hmac => None,
         }
     }
 
@@ -471,6 +501,18 @@ impl Cipher for OwnCipher {
         salt: &[u8],
         params: Option<&[u8]>,
     ) -> Result<Key> {
+        if enctype.is_rc4() {
+            // No iteration count: RFC 4757 §3 hashes the password in UTF-16LE under the principal,
+            // and a `s2kparams` value there means the caller expected a different enctype.
+            if let Some(params) = params
+                && !params.is_empty()
+            {
+                return Err(Error::Config(
+                    "rc4-hmac has no string-to-key parameters: its key is a single HMAC".into(),
+                ));
+            }
+            return Key::new(enctype, rc4::string_to_key(password, salt));
+        }
         Key::new(enctype, kdf::s2k(enctype, password, salt, params)?)
     }
 
@@ -481,6 +523,11 @@ impl Cipher for OwnCipher {
         salt: &[u8],
         params: Option<&[u8]>,
     ) -> Result<Key> {
+        if enctype.is_rc4() {
+            // RC4 has no iteration count, so there is no weak variant to allow: the strict path is
+            // the only path.
+            return self.s2k(enctype, password, salt, params);
+        }
         Key::new(
             enctype,
             kdf::s2k_allow_weak(enctype, password, salt, params)?,
@@ -494,10 +541,22 @@ impl Cipher for OwnCipher {
         usage: u32,
         use_: KeyUse,
     ) -> Result<Vec<u8>> {
+        if enctype.is_rc4() {
+            // `K1 = HMAC-MD5(key, usage_le32)`, and encryption and integrity share it: RFC 4757 has
+            // one usage key where RFC 3961 has `Ke` and `Ki`.
+            let _ = use_;
+            return Ok(rc4::derived_key(base, usage));
+        }
         kdf::derive_key(enctype, base, usage, use_)
     }
 
     fn encrypt(&self, key: &Key, usage: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if key.enctype().is_rc4() {
+            let mut confounder = vec![0u8; key.enctype().confounder_len()];
+            getrandom::fill(&mut confounder)
+                .map_err(|e| Error::crypto(format!("getrandom: {e}")))?;
+            return rc4::encrypt(key.bytes(), usage, plaintext, &confounder);
+        }
         let (ke, ki) = self.parts(key, usage)?;
         profile::encrypt(key.enctype(), &ke, &ki, plaintext)
     }
@@ -509,16 +568,27 @@ impl Cipher for OwnCipher {
         plaintext: &[u8],
         confounder: &[u8],
     ) -> Result<Vec<u8>> {
+        if key.enctype().is_rc4() {
+            return rc4::encrypt(key.bytes(), usage, plaintext, confounder);
+        }
         let (ke, ki) = self.parts(key, usage)?;
         profile::encrypt_with_confounder(key.enctype(), &ke, &ki, confounder, plaintext)
     }
 
     fn decrypt(&self, key: &Key, usage: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if key.enctype().is_rc4() {
+            return rc4::decrypt(key.bytes(), usage, ciphertext);
+        }
         let (ke, ki) = self.parts(key, usage)?;
         profile::decrypt(key.enctype(), &ke, &ki, ciphertext)
     }
 
     fn checksum(&self, key: &Key, usage: u32, data: &[u8]) -> Result<Vec<u8>> {
+        if key.enctype().is_rc4() {
+            // Not a derivation: the whole checksum of this enctype is its own construction, keyed
+            // with the long-term key rather than a usage-derived one.
+            return Ok(rc4::checksum(key.bytes(), usage, data));
+        }
         let kc = kdf::derive_key(key.enctype(), key.bytes(), usage, KeyUse::Checksum)?;
         profile::checksum(key.enctype(), &kc, data)
     }
@@ -567,11 +637,15 @@ mod tests {
             assert_eq!(e.key_len(), if e.id() % 2 == 0 { 32 } else { 16 });
             assert!(e.mac_len() >= 12);
         }
-        assert_eq!(
-            Enctype::from_id(23),
-            None,
-            "RC4 is not implemented on purpose"
+        // RC4 is implemented, and deliberately not in `ALL`: a realm that lists it can accept an
+        // AD or Heimdal key, and a realm that does not never offers it.
+        assert_eq!(Enctype::from_id(23), Some(Enctype::Rc4Hmac));
+        assert!(
+            !Enctype::ALL.contains(&Enctype::Rc4Hmac),
+            "a weak enctype must not be in the list a realm offers by default"
         );
+        assert_eq!(Enctype::Rc4Hmac.confounder_len(), 8);
+        assert_eq!(Enctype::Rc4Hmac.checksum_type(), crate::rc4::CHECKSUM_TYPE);
     }
 
     #[test]
@@ -585,7 +659,15 @@ mod tests {
             Enctype::parse_list(&["aes-256", "aes256-sha1"]).unwrap(),
             vec![Enctype::Aes256Sha1]
         );
-        assert!(Enctype::parse_list(&["rc4-hmac"]).is_err());
+        // RC4's three spellings all name it; des3 is still not implemented, and saying so is the
+        // point of the strict parse.
+        for name in ["rc4-hmac", "arcfour-hmac", "arcfour-hmac-md5"] {
+            assert_eq!(
+                Enctype::parse_list(&[name]).unwrap(),
+                vec![Enctype::Rc4Hmac],
+                "{name}"
+            );
+        }
         assert!(Enctype::parse_list(&["des3-cbc-sha1"]).is_err());
     }
 

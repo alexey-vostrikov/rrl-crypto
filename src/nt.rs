@@ -48,10 +48,7 @@ pub fn hash(utf16: &[u8]) -> Result<[u8; 16]> {
 /// reads one from a configuration file. It encodes with `encode_utf16`, so the two entry points
 /// agree by construction.
 pub fn hash_password(password: &str) -> [u8; 16] {
-    let octets: Vec<u8> = password
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    let octets: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
     hash(&octets).expect("a string's UTF-16LE encoding is always an even number of octets")
 }
 
@@ -65,7 +62,10 @@ mod tests {
     /// with `printf 'Password' | iconv -f utf-8 -t utf-16le | openssl dgst -md4 -provider legacy`.
     #[test]
     fn the_hash_of_password_matches_the_published_value() {
-        let utf16: Vec<u8> = "Password".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16: Vec<u8> = "Password"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(
             hash(&utf16).expect("an even number of octets"),
             [
@@ -102,7 +102,10 @@ mod tests {
     /// The text entry point and the octet entry point are one computation.
     #[test]
     fn the_text_spelling_agrees_with_the_octets() {
-        let utf16: Vec<u8> = "Password".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16: Vec<u8> = "Password"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(
             hash_password("Password"),
             hash(&utf16).expect("an even number of octets")
@@ -113,7 +116,11 @@ mod tests {
     /// password would still pass every vector above, all of which are short.
     #[test]
     fn a_long_password_is_hashed_in_full() {
-        let mut a: Vec<u8> = "x".repeat(200).encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let a: Vec<u8> = "x"
+            .repeat(200)
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         let b_octets = &mut a.clone();
         let last = b_octets.len() - 2;
         b_octets[last] ^= 0x01;

@@ -87,7 +87,10 @@ fn a_ciphertext_of_the_wrong_length_is_refused() {
         let usage = rrl_crypto::usage::AS_REP_ENCPART;
         let ciphertext = cipher.encrypt(&key, usage, plaintext).expect("encrypts");
 
-        for wrong in [&ciphertext[..ciphertext.len() - 1], &[&ciphertext[..], &[0u8][..]].concat()] {
+        for wrong in [
+            &ciphertext[..ciphertext.len() - 1],
+            &[&ciphertext[..], &[0u8][..]].concat(),
+        ] {
             assert!(
                 cipher.decrypt(&key, usage, wrong).is_err(),
                 "{enctype:?}: a length of {} was accepted for a ciphertext of {}",
@@ -98,7 +101,9 @@ fn a_ciphertext_of_the_wrong_length_is_refused() {
 
         // Truncated to less than the overhead: nothing about it is a ciphertext at all.
         assert!(
-            cipher.decrypt(&key, usage, &ciphertext[..enctype.overhead() - 1]).is_err(),
+            cipher
+                .decrypt(&key, usage, &ciphertext[..enctype.overhead() - 1])
+                .is_err(),
             "{enctype:?}: less than the overhead was accepted"
         );
     }
@@ -205,7 +210,10 @@ fn a_fixed_confounder_makes_the_same_ciphertext_and_still_verifies() {
         let b = cipher
             .encrypt_with_confounder(&key, usage, plaintext, &confounder)
             .expect("encrypts");
-        assert_eq!(a, b, "{enctype:?}: the same confounder gave different octets");
+        assert_eq!(
+            a, b,
+            "{enctype:?}: the same confounder gave different octets"
+        );
         assert_eq!(
             cipher.decrypt(&key, usage, &a).expect("opens"),
             plaintext,
@@ -269,9 +277,7 @@ fn a_checksum_is_verified_over_its_whole_length() {
             let mut damaged = tag.clone();
             damaged[index] ^= 0x80;
             assert!(
-                cipher
-                    .verify_checksum(&key, usage, data, &damaged)
-                    .is_err(),
+                cipher.verify_checksum(&key, usage, data, &damaged).is_err(),
                 "{enctype:?}: octet {index} of the checksum was not compared"
             );
         }
