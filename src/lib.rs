@@ -644,6 +644,40 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     digest.finalize().into()
 }
 
+/// MD5 over the concatenation of `parts`, without building the concatenation.
+///
+/// The NTLM keys are `MD5(a || b || ...)` over pieces that are already in memory, and every caller
+/// that wrote this itself wrote the same three lines. Taking the parts keeps the primitive here,
+/// where the rest of the family finds it, and avoids an allocation whose only purpose would be to
+/// hand the same octets to a hasher that accepts them one at a time anyway.
+pub fn md5_parts(parts: &[&[u8]]) -> [u8; 16] {
+    use md5::{Digest, Md5};
+    let mut digest = Md5::new();
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
+
+/// `HMAC-MD5(key, parts...)`, the MAC both NTLM answers are keyed with.
+///
+/// MS-NLMP keys `NTOWFv2` and the NTLMv2 proof with HMAC-MD5, and three call sites across two crates
+/// had written the same construction. It is not a primitive anyone should reach for otherwise; it is
+/// here because the secure channel defines itself in terms of it, the same reason the NT hash lives
+/// beside it.
+///
+/// The parts are taken as slices for the reason [`md5_parts`] gives: every caller has the pieces
+/// already and none of them wants an allocation to join them.
+pub fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<md5::Md5> as KeyInit>::new_from_slice(key)
+        .expect("HMAC-MD5 accepts a key of any length");
+    for part in parts {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().into()
+}
+
 /// Whether two slices are equal, in constant time.
 ///
 /// The length test is not a leak: every caller compares values whose length is public - a MAC, a
@@ -858,5 +892,40 @@ mod tests {
         // the length check without looking at the contents gets this one right by accident and the
         // one above wrong.
         assert!(!ct_eq(b"secret ", b"secret"));
+    }
+
+    /// HMAC-MD5, against RFC 2202's first test case.
+    ///
+    /// The vector is the RFC's, not this implementation's: `0b` sixteen times over "Hi There" is
+    /// `9294727a...`, and the same octets split into three parts must give the same answer - which
+    /// is the whole point of taking the message as slices.
+    #[test]
+    fn hmac_md5_matches_the_rfc_vector_and_does_not_care_how_the_message_is_split() {
+        let key = [0x0bu8; 16];
+        let whole = hmac_md5(&key, &[b"Hi There"]);
+        assert_eq!(
+            whole,
+            [
+                0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8, 0x15, 0x8b,
+                0xfc, 0x9d
+            ]
+        );
+        assert_eq!(hmac_md5(&key, &[b"Hi ", b"Th", b"ere"]), whole);
+        // An empty part is not a separator: the MAC is over the concatenation, and splitting twice
+        // at the same place must not move the answer.
+        assert_eq!(hmac_md5(&key, &[b"", b"Hi There", b""]), whole);
+    }
+
+    /// MD5 over parts, against a digest computed outside this crate.
+    #[test]
+    fn md5_over_parts_is_the_digest_of_their_concatenation() {
+        let expected: [u8; 16] = [
+            0xe8, 0x0b, 0x50, 0x17, 0x09, 0x89, 0x50, 0xfc, 0x58, 0xaa, 0xd8, 0x3c, 0x8c, 0x14,
+            0x97, 0x8e,
+        ];
+        assert_eq!(md5_parts(&[b"abc", b"def"]), expected);
+        assert_eq!(md5_parts(&[b"abcdef"]), expected);
+        // The empty input is `d41d8cd9...`, which is what a caller that passed no parts would get.
+        assert_eq!(md5_parts(&[]), md5(b""));
     }
 }
