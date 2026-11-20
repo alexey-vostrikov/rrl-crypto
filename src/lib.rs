@@ -42,12 +42,14 @@
 
 pub mod aes_cts;
 pub mod checksum;
+pub mod der;
 pub mod error;
 pub mod kdf;
 pub mod nfold;
 pub mod nt;
 pub mod profile;
-pub mod rc4; // rc4-hmac (enctype 23), RFC 4757: the one envelope that is not RFC 3961's
+pub mod rc4;
+pub mod time; // rc4-hmac (enctype 23), RFC 4757: the one envelope that is not RFC 3961's
 
 #[cfg(feature = "crypto-rskrb5")]
 pub mod rskrb5_backend;
