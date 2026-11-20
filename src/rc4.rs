@@ -32,8 +32,6 @@
 //! where RFC 4120 wants a keyed checksum — the authenticator, the KDC-REQ-BODY — and getting it
 //! wrong breaks AP-REQs against every Windows service.
 
-use md5::{Digest, Md5};
-
 use crate::KeyUse;
 use crate::error::{Error, Result};
 
@@ -60,19 +58,12 @@ pub fn usage_code(usage: u32) -> u32 {
     }
 }
 
-/// `HMAC-MD5(key, parts)`.
-fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-    use hmac::{Hmac, KeyInit, Mac};
-    let mut mac =
-        <Hmac<Md5> as KeyInit>::new_from_slice(key).expect("HMAC-MD5 accepts a key of any length");
-    for part in parts {
-        mac.update(part);
-    }
-    let out = mac.finalize().into_bytes();
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&out);
-    tag
-}
+/// `HMAC-MD5(key, parts)`, taken from the crate root (RRL-7.6).
+///
+/// This module had its own copy while the root had none; now that the root has one, the copy here is
+/// gone. A MAC is the last place to keep two answers: a difference between them is invisible until a
+/// ticket fails to verify.
+use crate::hmac_md5;
 
 /// RC4's keystream applied to `data` (RFC 6229's algorithm; the cipher is its own inverse).
 fn rc4(key: &[u8], data: &mut [u8]) {
@@ -183,23 +174,20 @@ pub fn string_to_key(password: &[u8], _salt: &[u8]) -> [u8; 16] {
 /// The keyed checksum of this enctype: `HMAC-MD5(Ksign, MD5(usage_le32 || data))` with
 /// `Ksign = HMAC-MD5(key, "signaturekey")` (Heimdal's `_krb5_HMAC_MD5_checksum`).
 pub fn checksum(key: &[u8], usage: u32, data: &[u8]) -> Vec<u8> {
-    let ksign = hmac_md5(key, &[b"signaturekey"]);
-    let mut digest = Md5::new();
-    digest.update(usage_code(usage).to_le_bytes());
-    digest.update(data);
-    let digest = digest.finalize();
-    hmac_md5(&ksign, &[&digest]).to_vec()
+    checksum_parts(key, usage, &[data])
 }
 
 /// The usage-independent half of [`checksum`], for a caller that checks one over parts.
+///
+/// RRL-7.6: the digest over the parts is the crate's `md5_parts`, so this module no longer touches
+/// MD5 itself.
 pub fn checksum_parts(key: &[u8], usage: u32, parts: &[&[u8]]) -> Vec<u8> {
     let ksign = hmac_md5(key, &[b"signaturekey"]);
-    let mut digest = Md5::new();
-    digest.update(usage_code(usage).to_le_bytes());
-    for part in parts {
-        digest.update(part);
-    }
-    let digest = digest.finalize();
+    let mut digested: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+    let usage_bytes = usage_code(usage).to_le_bytes();
+    digested.push(&usage_bytes);
+    digested.extend_from_slice(parts);
+    let digest = crate::md5_parts(&digested);
     hmac_md5(&ksign, &[&digest]).to_vec()
 }
 
@@ -212,6 +200,10 @@ pub fn derived_key(key: &[u8], usage: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The test below builds the checksum from its definition with the digest and the MAC directly,
+    // so that it cannot agree with the implementation by sharing it - which is why this import is
+    // here and not at the top of the module.
+    use md5::{Digest, Md5};
 
     /// RFC 6229's RC4 test vector for a five-octet key: `8332 4aab 3ba2 fb`? No — the published
     /// vector is for key `0102030405`, whose first keystream octets are `b2 39 63 05 f0 3d`.
