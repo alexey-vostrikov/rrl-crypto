@@ -743,6 +743,49 @@ mod tests {
         assert_eq!(Enctype::Rc4Hmac.checksum_type(), crate::rc4::CHECKSUM_TYPE);
     }
 
+    /// The aliases exist for callers that spell these names the way MIT, Heimdal or the RFC do.
+    /// An alias that drifts from its twin is the worst kind of defect: both sides compile, both
+    /// are `pub`, and only a consumer in another crate notices - by which point the wire value is
+    /// wrong. Mutation testing found this: sixteen mutants replacing an alias body with a constant
+    /// survived, because no test in this crate ever calls one.
+    #[test]
+    fn every_alias_agrees_with_the_name_it_stands_for() {
+        // RC4 too: it is outside `ALL` but implemented, so its aliases are just as reachable.
+        for e in Enctype::ALL.into_iter().chain([Enctype::Rc4Hmac]) {
+            assert_eq!(e.etype(), e.id(), "etype must be id, for {e:?}");
+            assert_eq!(e.as_i32(), e.id(), "as_i32 must be id, for {e:?}");
+            assert_eq!(e.key_size(), e.key_len(), "key_size must be key_len, for {e:?}");
+            assert_eq!(e.ke_len(), e.key_len(), "Ke must be the key length, for {e:?}");
+            assert_eq!(
+                e.ki_len(),
+                e.integrity_key_len(),
+                "Ki must be the integrity key length, for {e:?}"
+            );
+            assert_eq!(
+                e.kc_len(),
+                e.checksum_key_len(),
+                "Kc must be the checksum key length, for {e:?}"
+            );
+            assert_eq!(
+                e.is_rfc8009(),
+                e.sha2_kind().is_some(),
+                "the RFC 8009 flag must follow the profile, for {e:?}"
+            );
+        }
+        // The aliases are not all the same number, so the comparisons above can fail: a test that
+        // only compared values that happen to be equal everywhere would prove nothing.
+        assert_ne!(
+            Enctype::Aes256Sha1.key_len(),
+            Enctype::Rc4Hmac.key_len(),
+            "the fixtures must differ, or the equality above is vacuous"
+        );
+        // RFC 8009 is the SHA-2 profile: aes256-cts-hmac-sha384-96 yes, aes256-cts-hmac-sha1-96 no.
+        // The first version of this guard paired Aes256Sha1 with RC4 - both SHA-1 family, both
+        // false - and the guard failed, which is what it is for.
+        assert!(Enctype::Aes256Sha384.is_rfc8009());
+        assert!(!Enctype::Aes256Sha1.is_rfc8009());
+    }
+
     #[test]
     fn enctype_list_refuses_what_it_cannot_issue() {
         assert_eq!(
