@@ -645,6 +645,16 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 }
 
 /// Whether two slices are equal, in constant time.
+///
+/// The length test is not a leak: every caller compares values whose length is public - a MAC, a
+/// tag, a nonce, a token header - and a length that differs cannot be made equal by any content.
+/// What must not leak is *how far* two same-length values agree, so the loop runs to the end
+/// whatever it finds.
+///
+/// `black_box` is not decoration: without it a future optimiser may turn the accumulate-then-test
+/// back into an early-exit loop, which is the forgery oracle this function exists to avoid. Two of
+/// the four copies this replaced had it and two did not, so consolidating on the version without it
+/// would have quietly weakened the callers that had it.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -653,7 +663,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     for (x, y) in a.iter().zip(b) {
         diff |= x ^ y;
     }
-    diff == 0
+    core::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
