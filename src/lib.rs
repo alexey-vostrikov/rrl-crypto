@@ -58,7 +58,9 @@ use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub use kdf::{KeyUse, Sha2Kind, dk, dr, kdf_hmac_sha2, s2k, usage, usage_constant};
+pub use kdf::{
+    KdfHash, KeyUse, Sha2Kind, dk, dr, kdf_hmac_sha2, s2k, sp_800_56a, usage, usage_constant,
+};
 
 /// The AES block size, and the length of every Kerberos confounder.
 pub const AES_BLOCK: usize = 16;

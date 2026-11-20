@@ -19,7 +19,7 @@
 
 use aes::cipher::BlockCipherEncrypt;
 use hmac::{Hmac, KeyInit, Mac};
-use sha1::Sha1;
+use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha384};
 
 use super::Enctype;
@@ -255,6 +255,50 @@ pub fn kdf_hmac_sha2(
     msg.extend_from_slice(&k_bits.to_be_bytes());
     let mac = hmac_by(kind, key, &msg);
     Ok(mac[..(k_bits / 8) as usize].to_vec())
+}
+
+/// The hash a KDF is built on, where the choice is a parameter rather than an enctype.
+///
+/// `Sha2Kind` answers "which SHA-2" for the enctypes, and stops there because RFC 3961 and RFC 8009
+/// only ever ask for 256 or 384. A counter-mode KDF is asked by whatever protocol is calling it -
+/// SP 800-56A names SHA-1, SHA-256 and SHA-512 - so the set here is wider and includes the one hash
+/// this crate otherwise leaves to the Kerberos checksums.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KdfHash {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// SP 800-56A single-step KDF: `H(counter || Z || OtherInfo)`, counters from 1, truncated to `len`.
+///
+/// The counter is 32-bit big-endian and starts at one, and `OtherInfo` is opaque here: what goes into
+/// it is the protocol's business - PKINIT builds it from two principals and the enctypes, and a
+/// different protocol would build something else. `len` is in **octets**, unlike the SP 800-108
+/// function above, whose field is in bits because that field travels inside the MAC; here the length
+/// never reaches the hash, so it cannot be got wrong the same way.
+pub fn sp_800_56a(kind: KdfHash, z: &[u8], other_info: &[u8], len: usize) -> Vec<u8> {
+    fn run<H: Digest>(z: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut counter = 1u32;
+        while out.len() < len {
+            let mut h = H::new();
+            h.update(counter.to_be_bytes());
+            h.update(z);
+            h.update(info);
+            out.extend_from_slice(&h.finalize());
+            counter += 1;
+        }
+        out.truncate(len);
+        out
+    }
+    match kind {
+        KdfHash::Sha1 => run::<sha1::Sha1>(z, other_info, len),
+        KdfHash::Sha256 => run::<sha2::Sha256>(z, other_info, len),
+        KdfHash::Sha384 => run::<sha2::Sha384>(z, other_info, len),
+        KdfHash::Sha512 => run::<sha2::Sha512>(z, other_info, len),
+    }
 }
 
 /// PBKDF2 (RFC 2898) over an arbitrary HMAC PRF.
@@ -523,6 +567,38 @@ mod tests {
             "bfab388bdcb238e9f9c98d6a878304f04d30c82556375ac507a7a852790f4674",
         ),
     ];
+
+    /// SP 800-56A's counter-mode KDF, against a digest computed outside this crate.
+    ///
+    /// The vectors are `H(counter_be32 || Z || OtherInfo)` in Python, so they pin the construction
+    /// rather than this implementation of it. The 48-octet case is the one that matters: it is the
+    /// only one that runs the counter past 1, and a KDF that forgets to increment produces the first
+    /// block repeated - which agrees with the 32-octet vector and disagrees here.
+    #[test]
+    fn sp_800_56a_is_the_counter_mode_construction() {
+        let z = b"secret-shared-value";
+        let info = b"protocol-info";
+
+        assert_eq!(
+            hex::encode(sp_800_56a(KdfHash::Sha256, z, info, 32)),
+            "daf5ddeb8aefb7796b539fa9a21d727b41a0ca2087e8b4b6e9ae2c3f5e41c625"
+        );
+        assert_eq!(
+            hex::encode(sp_800_56a(KdfHash::Sha1, z, info, 20)),
+            "5092029790433acb243d80ee4a44387bcfbe7ad8"
+        );
+        assert_eq!(
+            hex::encode(sp_800_56a(KdfHash::Sha512, z, info, 16)),
+            "99eabb05abc10acdaecc4f9a69f74dba"
+        );
+        assert_eq!(
+            hex::encode(sp_800_56a(KdfHash::Sha256, z, info, 48)),
+            "daf5ddeb8aefb7796b539fa9a21d727b41a0ca2087e8b4b6e9ae2c3f5e41c625\
+             b36b600c284ab6de3bd5562f272b707f"
+        );
+        // A zero-length request is nothing, not the first block: truncation happens at the end.
+        assert!(sp_800_56a(KdfHash::Sha256, z, info, 0).is_empty());
+    }
 
     #[test]
     fn mit_derive_vectors() {
