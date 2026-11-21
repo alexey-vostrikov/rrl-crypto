@@ -322,8 +322,13 @@ pub fn sp_800_56a(kind: KdfHash, z: &[u8], other_info: &[u8], len: usize) -> Vec
     }
 }
 
-/// PBKDF2 (RFC 2898) over an arbitrary HMAC PRF.
-fn pbkdf2(
+/// PBKDF2 (RFC 8018 §5.2) over any PRF the caller supplies.
+///
+/// Public because PKCS#12's password-based encryption is the same construction with SHA-1 or a
+/// SHA-2 chosen by the file, and a second implementation of it would be a second answer to "how are
+/// the octets of a derived key produced". The PRF is a parameter rather than fixed so that the
+/// legacy bags, which predate SHA-2, are covered by the same loop.
+pub fn pbkdf2(
     prf: impl Fn(&[u8], &[u8]) -> Vec<u8>,
     password: &[u8],
     salt: &[u8],

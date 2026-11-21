@@ -33,6 +33,26 @@ rskrb5 = { version = "0.2", default-features = false, optional = true }
 # `Enctype` as a JSON number, for a control plane that lists allowed enctypes.
 serde = { version = "1", features = ["derive"], optional = true }
 
+# The `pkcs` feature's dependencies. All optional, because most consumers want the Kerberos
+# primitives and nothing that reads a certificate: `rrl-smb` checks an NTLM MAC and should not pull
+# in three elliptic curves and a big-integer library to do it.
+#
+# `crypto-bigint` and not a full bignum crate: the only arithmetic here is modular exponentiation
+# over an RSA modulus, boxed because the modulus arrives at run time.
+crypto-bigint = { version = "0.7.5", optional = true, default-features = false, features = ["alloc"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+# `rand` here and not `getrandom` above: EC key generation and CMS's content key want a `CryptoRng`,
+# and this module is off by default so the difference in taste does not reach the hot path.
+rand = { version = "0.8", optional = true }
+# DES and RC2 for PKCS#12's legacy bags. Both are broken by design and present only because a file
+# written in 2003 still opens. PBKDF2, the derivation around them, is this crate's own (`kdf`): the
+# `pbkdf2` crate pins a release candidate that `rskrb5` needs, and a second PBKDF2 would be a second
+# answer to how a key's octets are produced.
+des = { version = "0.9", optional = true }
+rc2 = { version = "0.9", optional = true }
+
 [dev-dependencies]
 hex = "0.4"
 # The vectors are MIT's and Heimdal's, kept as JSON so the table is a file a reviewer can diff
@@ -50,3 +70,17 @@ default = []
 crypto-rskrb5 = ["dep:rskrb5"]
 # Serialise `Enctype` by its RFC number, the way every `krb5.conf` spells it.
 serde = ["dep:serde"]
+# Certificates, CMS and PKCS#12 (`rrl_crypto::pkcs`). Off by default: a consumer that only checks a
+# MAC should not build three curves and a bignum library to do it.
+# The fixtures this crate's own tests are built from, for a sibling crate's tests: certificates and
+# a CMS envelope that a PKINIT scenario needs. Never on in a release build.
+test-support = []
+pkcs = [
+    "dep:crypto-bigint",
+    "dep:p256",
+    "dep:p384",
+    "dep:p521",
+    "dep:rand",
+    "dep:des",
+    "dep:rc2",
+]

@@ -55,6 +55,13 @@ pub mod profile;
 pub mod rc4; // rc4-hmac (enctype 23), RFC 4757: the one envelope that is not RFC 3961's
 pub mod time;
 
+/// Certificates, CMS and PKCS#12: the envelopes keys and identities travel in.
+///
+/// Behind the `pkcs` feature, because most consumers want the primitives above and nothing that
+/// reads a certificate.
+#[cfg(feature = "pkcs")]
+pub mod pkcs;
+
 #[cfg(feature = "crypto-rskrb5")]
 pub mod rskrb5_backend;
 
