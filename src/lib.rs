@@ -42,12 +42,18 @@
 
 pub mod aes_cts;
 pub mod checksum;
+// ASN.1: the encoder every structure in the family is framed with, and the time spellings that go
+// inside it. Not cryptography in the sense of computing a key or a MAC — it decides the octets a
+// checksum then covers, which is why it lives where the checksums do: one encoder, one answer to
+// "what exactly was signed", for a ticket, a certificate and a CMS envelope alike.
+pub mod der;
 pub mod error;
 pub mod kdf;
 pub mod nfold;
 pub mod nt;
 pub mod profile;
 pub mod rc4; // rc4-hmac (enctype 23), RFC 4757: the one envelope that is not RFC 3961's
+pub mod time;
 
 #[cfg(feature = "crypto-rskrb5")]
 pub mod rskrb5_backend;
