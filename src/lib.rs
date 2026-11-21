@@ -754,8 +754,16 @@ mod tests {
         for e in Enctype::ALL.into_iter().chain([Enctype::Rc4Hmac]) {
             assert_eq!(e.etype(), e.id(), "etype must be id, for {e:?}");
             assert_eq!(e.as_i32(), e.id(), "as_i32 must be id, for {e:?}");
-            assert_eq!(e.key_size(), e.key_len(), "key_size must be key_len, for {e:?}");
-            assert_eq!(e.ke_len(), e.key_len(), "Ke must be the key length, for {e:?}");
+            assert_eq!(
+                e.key_size(),
+                e.key_len(),
+                "key_size must be key_len, for {e:?}"
+            );
+            assert_eq!(
+                e.ke_len(),
+                e.key_len(),
+                "Ke must be the key length, for {e:?}"
+            );
             assert_eq!(
                 e.ki_len(),
                 e.integrity_key_len(),
