@@ -49,6 +49,20 @@ pub enum Sha2Kind {
     Sha384,
 }
 
+impl Sha2Kind {
+    /// The digest this kind produces, in bits.
+    ///
+    /// The KDF computes one HMAC and truncates it, so this is also the longest output it can give —
+    /// RFC 3961 §5.1 caps the derived length at the hash length. Public because a caller that asks
+    /// for a length needs to know the ceiling before it asks, rather than read it out of an error.
+    pub const fn output_bits(self) -> u32 {
+        match self {
+            Sha2Kind::Sha256 => 256,
+            Sha2Kind::Sha384 => 384,
+        }
+    }
+}
+
 fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut m = <Hmac<Sha1> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     m.update(msg);
@@ -233,6 +247,11 @@ pub fn dk(base_key: &[u8], constant: &[u8], k: usize) -> Result<Vec<u8>> {
 /// context, and `k` is the length in **bits** — writing the octet count there
 /// produces a plausible key that is silently wrong, because the field is
 /// inside the MAC.
+///
+/// One HMAC is computed and truncated, so `k` cannot exceed the digest the kind produces: RFC 3961
+/// §5.1 caps the output at the hash length for exactly this reason. The guard says so and returns
+/// `Err`; before it did, a caller asking for more got a panic out of the slice below — an argument
+/// error surfacing as a crash inside a crypto crate.
 pub fn kdf_hmac_sha2(
     kind: Sha2Kind,
     key: &[u8],
@@ -240,9 +259,11 @@ pub fn kdf_hmac_sha2(
     context: Option<&[u8]>,
     k_bits: u32,
 ) -> Result<Vec<u8>> {
-    if k_bits == 0 || !k_bits.is_multiple_of(8) || k_bits > 8 * 64 {
+    if k_bits == 0 || !k_bits.is_multiple_of(8) || k_bits > kind.output_bits() {
         return Err(Error::Crypto(format!(
-            "KDF output length {k_bits} bits is not a valid whole-octet length"
+            "KDF output length {k_bits} bits is not a valid whole-octet length for \
+             {kind:?}, which yields at most {} bits",
+            kind.output_bits()
         )));
     }
     let mut msg = Vec::with_capacity(4 + label.len() + 1 + context.map_or(0, |c| c.len()) + 4);
@@ -818,6 +839,125 @@ mod tests {
         assert!(dr(&[0u8; 16], b"", 16).is_err());
         assert!(dr(&[0u8; 16], &[0u8; 17], 16).is_err());
         assert!(dr(&[0u8; 15], b"const", 16).is_err());
+    }
+
+    /// Both ends of the output length, separately: RFC 3961 §5.1 makes a key at most 32 octets, and
+    /// the guard reads `k == 0 || k > 32`.
+    ///
+    /// The mutation that survived was `||` → `&&`, which rejects neither end: `dr(…, 0)` then returns
+    /// an empty key and `dr(…, 33)` an over-long one, and nothing notices. The existing tests asked
+    /// for 16 octets and a bad key or constant, so both ends of this guard were never reached.
+    #[test]
+    fn dr_refuses_an_output_length_outside_one_to_thirty_two() {
+        assert!(
+            dr(&[0u8; 16], b"const", 0).is_err(),
+            "zero octets is not a key"
+        );
+        assert!(
+            dr(&[0u8; 16], b"const", 33).is_err(),
+            "33 octets is past the cap"
+        );
+        for k in [1usize, 32] {
+            let got = dr(&[0u8; 16], b"const", k).expect("a legal length");
+            assert_eq!(got.len(), k, "the caller gets exactly the octets asked for");
+        }
+    }
+
+    /// A constant of exactly one AES block goes in unfolded.
+    ///
+    /// The mutation `len > AES_BLOCK` → `>=` survives here and that is correct: the equality branch
+    /// above it is taken first, so the `else if` is only reached when the length differs from a
+    /// block, and `>` and `>=` cannot be told apart. An equivalent mutant, not a gap — but the
+    /// behaviour still deserves a test, because the identity it rests on (folding a block-sized
+    /// constant is folding nothing) is what makes the two paths agree, and no published vector
+    /// reaches this branch at all: every DR vector uses `usage || tag`, five octets for the AES
+    /// enctypes.
+    #[test]
+    fn dr_takes_a_constant_of_exactly_one_block() {
+        let constant = [7u8; 16];
+        let got = dr(&[0u8; 16], &constant, 16).expect("a full-block constant is legal");
+        let folded = dr(&[0u8; 16], &n_fold(&constant, AES_BLOCK * 8), 16).expect("folded");
+        assert_eq!(
+            got, folded,
+            "a block-sized constant is used as it is, which is the same as folding it"
+        );
+        let other = dr(&[0u8; 16], &[8u8; 16], 16).expect("another constant");
+        assert_ne!(got, other, "the constant reaches the cipher");
+    }
+
+    /// SP 800-108's `L` names the output in bits, but this KDF computes one HMAC and truncates it,
+    /// so the ceiling is the kind's own digest — 256 bits for SHA-256, 384 for SHA-384 — and it is
+    /// inclusive.
+    ///
+    /// Both mutations of the old `k_bits > 8 * 64` survived because only 100 bits was ever tried,
+    /// which fails the whole-octet check first. The old bound was wrong besides: asking SHA-256 for
+    /// 512 bits passed the guard and then panicked on the truncation, so an argument error came out
+    /// as a crash. The test that found it asks for one bit past the hash and one exactly at it.
+    #[test]
+    fn kdf_output_cap_is_the_hash_length() {
+        let max = kdf_hmac_sha2(Sha2Kind::Sha256, &[0u8; 16], b"lbl", None, 256)
+            .expect("256 bits is as far as SHA-256 reaches");
+        assert_eq!(max.len(), 32);
+        // The text, not just the `is_err`: a caller reading this out of a log needs to know which
+        // length and which ceiling, and `DerError::fmt` surviving its mutation in the sibling crate
+        // is what an unchecked message reads like. Substrings, because the prefix belongs to `Error`.
+        let err = kdf_hmac_sha2(Sha2Kind::Sha256, &[0u8; 16], b"lbl", None, 264)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("264 bits"), "{err}");
+        assert!(err.contains("Sha256"), "{err}");
+        assert!(err.contains("at most 256 bits"), "{err}");
+
+        let wide = kdf_hmac_sha2(Sha2Kind::Sha384, &[0u8; 16], b"lbl", None, 384)
+            .expect("384 bits is as far as SHA-384 reaches");
+        assert_eq!(wide.len(), 48);
+        assert!(kdf_hmac_sha2(Sha2Kind::Sha384, &[0u8; 16], b"lbl", None, 392).is_err());
+    }
+
+    /// The hash length the KDF reports is the one it truncates to. A pair that disagreed would let a
+    /// caller ask for a length the guard allows and the slice then panics on, which is how the
+    /// 512-bit case behaved.
+    #[test]
+    fn the_reported_output_length_is_what_the_kdf_produces() {
+        for kind in [Sha2Kind::Sha256, Sha2Kind::Sha384] {
+            let bits = kind.output_bits();
+            let got = kdf_hmac_sha2(kind, &[0u8; 16], b"lbl", None, bits).expect("the maximum");
+            assert_eq!(
+                got.len() as u32 * 8,
+                bits,
+                "the ceiling is the digest for {kind:?}"
+            );
+            assert!(
+                kdf_hmac_sha2(kind, &[0u8; 16], b"lbl", None, bits + 8).is_err(),
+                "one octet past the ceiling is an error for {kind:?}"
+            );
+        }
+    }
+
+    /// The `s2kparams` iteration cap is inclusive: the cap itself is a count a KDC may send, one
+    /// more is refused.
+    ///
+    /// `count > MAX_ITERATIONS` mutated to `>=` refuses the maximum. Nothing noticed, because the
+    /// tests around it only used counts far below the cap and one `u32::MAX`.
+    #[test]
+    fn the_iteration_cap_admits_its_own_value() {
+        assert!(
+            s2k_iterations(
+                Enctype::Aes256Sha1,
+                Some(&MAX_ITERATIONS.to_be_bytes()),
+                true
+            )
+            .is_ok(),
+            "the cap itself is a legal count"
+        );
+        assert!(
+            s2k_iterations(
+                Enctype::Aes256Sha1,
+                Some(&(MAX_ITERATIONS + 1).to_be_bytes()),
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]
