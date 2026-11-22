@@ -107,6 +107,97 @@ pub(super) fn read_extensions(exts: &[u8]) -> Result<Vec<Extension>> {
     Ok(extensions)
 }
 
+/// The three parts a certificate is signed over, and the signature itself.
+struct SignedPart<'a> {
+    /// The content of `tbsCertificate`.
+    tbs_content: &'a [u8],
+    /// `tbsCertificate` whole, tag and length included: what a verifier hashes.
+    tbs: &'a [u8],
+    sig_alg: &'a [u8],
+    signature: Vec<u8>,
+}
+
+/// Splits a `Certificate` into the signed part and the signature around it.
+fn signed_part(der: &[u8]) -> Result<SignedPart<'_>> {
+    let mut outer = Reader::new(der);
+    let mut c = outer.seq()?;
+    outer.done("Certificate")?;
+    let (_, tbs_content, tbs) = c.next_raw()?;
+    let (sig_alg, _) = c.alg_id()?;
+    let signature = c.bits()?.to_vec();
+    c.done("Certificate")?;
+    Ok(SignedPart {
+        tbs_content,
+        tbs,
+        sig_alg,
+        signature,
+    })
+}
+
+/// The version, which is `[0] EXPLICIT INTEGER` and absent in a v1 certificate.
+fn version(t: &mut Reader<'_>) -> Result<i64> {
+    match t.optional(der::ctx(0))? {
+        Some(v) => Reader::new(v).int(),
+        None => Ok(0),
+    }
+}
+
+/// A certificate states its signature algorithm twice, and the two are one statement: a
+/// certificate where they differ is one nobody can check, so it is refused rather than guessed at.
+fn same_algorithm(t: &mut Reader<'_>, sig_alg: &[u8]) -> Result<()> {
+    let (inner, _) = t.alg_id()?;
+    if inner == sig_alg {
+        return Ok(());
+    }
+    err("certificate signature algorithms disagree")
+}
+
+/// `Validity ::= SEQUENCE { notBefore, notAfter }`.
+fn validity(t: &mut Reader<'_>) -> Result<(i64, i64)> {
+    let mut v = t.seq()?;
+    let not_before = read_time(&mut v)?;
+    let not_after = read_time(&mut v)?;
+    v.done("Validity")?;
+    Ok((not_before, not_after))
+}
+
+/// The subject's public key, as `SubjectPublicKeyInfo` states it.
+struct Spki {
+    alg: Vec<u8>,
+    params: Option<Vec<u8>>,
+    key: Vec<u8>,
+}
+
+fn public_key(t: &mut Reader<'_>) -> Result<Spki> {
+    let mut spki = t.seq()?;
+    let (alg, params) = spki.alg_id()?;
+    let key = spki.bits()?.to_vec();
+    spki.done("SubjectPublicKeyInfo")?;
+    Ok(Spki {
+        alg: alg.to_vec(),
+        params: params.map(<[u8]>::to_vec),
+        key,
+    })
+}
+
+/// `issuerUniqueID` and `subjectUniqueID`, which nothing here reads and which RFC 5280 retired.
+fn skip_unique_ids(t: &mut Reader<'_>) -> Result<()> {
+    t.optional(implicit(1))?;
+    t.optional(implicit(2))?;
+    Ok(())
+}
+
+/// The certificate's extensions, which only a v3 certificate may carry.
+fn read_cert_extensions(t: &mut Reader<'_>, version: i64) -> Result<Vec<Extension>> {
+    let Some(exts) = t.optional(der::ctx(3))? else {
+        return Ok(Vec::new());
+    };
+    if version != 2 {
+        return err("extensions in a certificate before v3");
+    }
+    read_extensions(exts)
+}
+
 impl Cert {
     /// ```text
     /// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature BIT STRING }
@@ -117,58 +208,31 @@ impl Cert {
     ///     subjectUniqueID [2] IMPLICIT OPTIONAL, extensions [3] EXPLICIT OPTIONAL }
     /// ```
     pub fn from_der(der: &[u8]) -> Result<Cert> {
-        let mut outer = Reader::new(der);
-        let mut c = outer.seq()?;
-        outer.done("Certificate")?;
-        let (_, tbs_content, tbs) = c.next_raw()?;
-        let (sig_alg, _) = c.alg_id()?;
-        let signature = c.bits()?.to_vec();
-        c.done("Certificate")?;
-
-        let mut t = Reader::new(tbs_content);
-        let version = match t.optional(der::ctx(0))? {
-            Some(v) => Reader::new(v).int()?,
-            None => 0,
-        };
+        let part = signed_part(der)?;
+        let mut t = Reader::new(part.tbs_content);
+        let version = version(&mut t)?;
         let serial = t.expect(der::INTEGER)?.to_vec();
-        let (inner_alg, _) = t.alg_id()?;
-        if inner_alg != sig_alg {
-            return err("certificate signature algorithms disagree");
-        }
+        same_algorithm(&mut t, part.sig_alg)?;
         let issuer = t.next_raw()?.2.to_vec();
-        let mut validity = t.seq()?;
-        let not_before = read_time(&mut validity)?;
-        let not_after = read_time(&mut validity)?;
-        validity.done("Validity")?;
+        let (not_before, not_after) = validity(&mut t)?;
         let subject = t.next_raw()?.2.to_vec();
-        let mut spki = t.seq()?;
-        let (key_alg, key_params) = spki.alg_id()?;
-        let key = spki.bits()?.to_vec();
-        spki.done("SubjectPublicKeyInfo")?;
-        // issuerUniqueID, subjectUniqueID: [1], [2] IMPLICIT BIT STRING.
-        t.optional(implicit(1))?;
-        t.optional(implicit(2))?;
-        let mut extensions = Vec::new();
-        if let Some(exts) = t.optional(der::ctx(3))? {
-            if version != 2 {
-                return err("extensions in a certificate before v3");
-            }
-            extensions = read_extensions(exts)?;
-        }
+        let key = public_key(&mut t)?;
+        skip_unique_ids(&mut t)?;
+        let extensions = read_cert_extensions(&mut t, version)?;
         t.done("TBSCertificate")?;
         Ok(Cert {
             der: der.to_vec(),
-            tbs: tbs.to_vec(),
-            sig_alg: sig_alg.to_vec(),
-            signature,
+            tbs: part.tbs.to_vec(),
+            sig_alg: part.sig_alg.to_vec(),
+            signature: part.signature,
             serial,
             issuer,
             subject,
             not_before,
             not_after,
-            key_alg: key_alg.to_vec(),
-            key_params: key_params.map(<[u8]>::to_vec),
-            key,
+            key_alg: key.alg,
+            key_params: key.params,
+            key: key.key,
             extensions,
         })
     }
