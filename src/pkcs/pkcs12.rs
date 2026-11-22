@@ -288,77 +288,138 @@ fn decrypt(
 ) -> Result<Vec<u8>> {
     let params = params.ok_or_else(|| Error::Malformed("encryption without parameters".into()))?;
     let mut p = Reader::new(params).seq()?;
-    let is = |o: &str| oid == asn1::oid(o);
-    if is(PBES2) {
-        // PBES2-params ::= SEQUENCE { keyDerivationFunc, encryptionScheme }
-        let (kdf, kdf_params) = p.alg_id()?;
-        let (enc, iv) = p.alg_id()?;
-        if kdf != asn1::oid(PBKDF2) {
-            return bad("PBES2 with a KDF other than PBKDF2");
-        }
-        let iv = Reader::new(iv.unwrap_or(&[])).octets()?;
-        let key_len = match () {
-            _ if enc == asn1::oid(AES128_CBC) => 16,
-            _ if enc == asn1::oid(AES192_CBC) => 24,
-            _ if enc == asn1::oid(AES256_CBC) => 32,
-            _ if enc == asn1::oid(DES_EDE3_CBC) => 24,
-            _ => return bad("unsupported PBES2 cipher"),
-        };
-        let key = pbkdf2_key(kdf_params, password.unwrap_or("").as_bytes(), key_len)?;
-        return match key_len {
-            16 => cbc_decrypt(
-                &aes::Aes128::new_from_slice(&key).expect("16"),
-                16,
-                iv,
-                data,
-            ),
-            24 if enc == asn1::oid(DES_EDE3_CBC) => cbc_decrypt(
-                &des::TdesEde3::new_from_slice(&key).expect("24"),
-                8,
-                iv,
-                data,
-            ),
-            24 => cbc_decrypt(
-                &aes::Aes192::new_from_slice(&key).expect("24"),
-                16,
-                iv,
-                data,
-            ),
-            _ => cbc_decrypt(
-                &aes::Aes256::new_from_slice(&key).expect("32"),
-                16,
-                iv,
-                data,
-            ),
-        };
+    if oid == asn1::oid(PBES2) {
+        return pbes2(&mut p, password, data);
     }
-    // pkcs-12PbeParams ::= SEQUENCE { salt OCTET STRING, iterations INTEGER }
+    legacy(oid, &mut p, password, data)
+}
+
+/// A block cipher this file format names, with the key length and block size it takes.
+#[derive(Clone, Copy)]
+enum Cipher {
+    Aes128,
+    Aes192,
+    Aes256,
+    Tdes3,
+}
+
+impl Cipher {
+    /// The cipher an AES or 3DES OID names, if it is one of them.
+    fn from_oid(oid: &[u8]) -> Option<Cipher> {
+        if oid == asn1::oid(AES128_CBC) {
+            return Some(Cipher::Aes128);
+        }
+        if oid == asn1::oid(AES192_CBC) {
+            return Some(Cipher::Aes192);
+        }
+        if oid == asn1::oid(AES256_CBC) {
+            return Some(Cipher::Aes256);
+        }
+        if oid == asn1::oid(DES_EDE3_CBC) {
+            return Some(Cipher::Tdes3);
+        }
+        None
+    }
+
+    /// The key length the cipher needs, which is also what the KDF is asked for.
+    fn key_len(self) -> usize {
+        match self {
+            Cipher::Aes128 => 16,
+            Cipher::Aes192 | Cipher::Tdes3 => 24,
+            Cipher::Aes256 => 32,
+        }
+    }
+
+    /// The block size, which the padding is measured in.
+    fn block(self) -> usize {
+        match self {
+            Cipher::Tdes3 => 8,
+            _ => 16,
+        }
+    }
+
+    fn decrypt(self, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+        use aes::cipher::KeyInit as _;
+        match self {
+            Cipher::Aes128 => cbc_decrypt(
+                &aes::Aes128::new_from_slice(key).expect("16"),
+                self.block(),
+                iv,
+                data,
+            ),
+            Cipher::Aes192 => cbc_decrypt(
+                &aes::Aes192::new_from_slice(key).expect("24"),
+                self.block(),
+                iv,
+                data,
+            ),
+            Cipher::Aes256 => cbc_decrypt(
+                &aes::Aes256::new_from_slice(key).expect("32"),
+                self.block(),
+                iv,
+                data,
+            ),
+            Cipher::Tdes3 => cbc_decrypt(
+                &des::TdesEde3::new_from_slice(key).expect("24"),
+                self.block(),
+                iv,
+                data,
+            ),
+        }
+    }
+}
+
+/// `PBES2-params ::= SEQUENCE { keyDerivationFunc, encryptionScheme }`.
+fn pbes2(p: &mut Reader<'_>, password: Option<&str>, data: &[u8]) -> Result<Vec<u8>> {
+    let (kdf, kdf_params) = p.alg_id()?;
+    let (enc, iv) = p.alg_id()?;
+    if kdf != asn1::oid(PBKDF2) {
+        return bad("PBES2 with a KDF other than PBKDF2");
+    }
+    let iv = Reader::new(iv.unwrap_or(&[])).octets()?;
+    let Some(cipher) = Cipher::from_oid(enc) else {
+        return bad("unsupported PBES2 cipher");
+    };
+    let key = pbkdf2_key(
+        kdf_params,
+        password.unwrap_or("").as_bytes(),
+        cipher.key_len(),
+    )?;
+    cipher.decrypt(&key, iv, data)
+}
+
+/// The PKCS #12 schemes before PBES2, whose parameters are `pkcs-12PbeParams ::= SEQUENCE { salt
+/// OCTET STRING, iterations INTEGER }` and whose key and IV both come from the file's own KDF.
+fn legacy(oid: &[u8], p: &mut Reader<'_>, password: Option<&str>, data: &[u8]) -> Result<Vec<u8>> {
     let salt = p.octets()?;
-    let rounds = iterations(&mut p)?;
+    let rounds = iterations(p)?;
     let pw = bmp(password);
     let k = |len| kdf12(Digest12::Sha1, 1, &pw, salt, rounds, len);
     let iv = kdf12(Digest12::Sha1, 2, &pw, salt, rounds, 8);
-    if is(PBE_SHA1_3DES) {
-        cbc_decrypt(
+    use aes::cipher::KeyInit as _;
+    if oid == asn1::oid(PBE_SHA1_3DES) {
+        return cbc_decrypt(
             &des::TdesEde3::new_from_slice(&k(24)).expect("24"),
             8,
             &iv,
             data,
-        )
-    } else if is(PBE_SHA1_2DES) {
-        cbc_decrypt(
+        );
+    }
+    if oid == asn1::oid(PBE_SHA1_2DES) {
+        return cbc_decrypt(
             &des::TdesEde2::new_from_slice(&k(16)).expect("16"),
             8,
             &iv,
             data,
-        )
-    } else if is(PBE_SHA1_RC2_40) {
-        cbc_decrypt(&rc2::Rc2::new_with_eff_key_len(&k(5), 40), 8, &iv, data)
-    } else if is(PBE_SHA1_RC2_128) {
-        cbc_decrypt(&rc2::Rc2::new_with_eff_key_len(&k(16), 128), 8, &iv, data)
-    } else {
-        bad("unsupported PKCS #12 encryption")
+        );
     }
+    if oid == asn1::oid(PBE_SHA1_RC2_40) {
+        return cbc_decrypt(&rc2::Rc2::new_with_eff_key_len(&k(5), 40), 8, &iv, data);
+    }
+    if oid == asn1::oid(PBE_SHA1_RC2_128) {
+        return cbc_decrypt(&rc2::Rc2::new_with_eff_key_len(&k(16), 128), 8, &iv, data);
+    }
+    bad("unsupported PKCS #12 encryption")
 }
 
 /// `PBKDF2-params ::= SEQUENCE { salt OCTET STRING, iterationCount,
@@ -389,37 +450,74 @@ fn pbkdf2_key(params: Option<&[u8]>, password: &[u8], len: usize) -> Result<Vec<
 /// `MacData ::= SEQUENCE { mac DigestInfo, macSalt OCTET STRING,
 /// iterations INTEGER DEFAULT 1 }` over the AuthenticatedSafe's octets.
 fn check_mac(mac_data: &[u8], password: Option<&str>, auth_safe: &[u8]) -> Result<()> {
+    let m = mac_info(mac_data)?;
+    let got = mac_value(&m, password, auth_safe)?;
+    // The comparison need not be constant-time: the MAC is over public data, and knowing it does
+    // not help guess the password.
+    if got != m.expected {
+        return Err(Error::BadPassword);
+    }
+    Ok(())
+}
+
+/// `MacData` minus its computed value: the algorithm, the digest the file states, the salt and the
+/// iteration count.
+struct MacInfo<'a> {
+    alg: &'a [u8],
+    alg_params: Option<&'a [u8]>,
+    expected: &'a [u8],
+    salt: &'a [u8],
+    rounds: u32,
+}
+
+/// `MacData ::= SEQUENCE { mac DigestInfo, macSalt OCTET STRING, iterations INTEGER DEFAULT 1 }`
+/// over the AuthenticatedSafe's octets.
+fn mac_info(mac_data: &[u8]) -> Result<MacInfo<'_>> {
     let mut m = Reader::new(mac_data).seq()?;
     let mut info = m.seq()?;
     let (alg, alg_params) = info.alg_id()?;
     let expected = info.octets()?;
     let salt = m.octets()?;
     let rounds = if m.is_empty() { 1 } else { iterations(&mut m)? };
-    let got = if alg == asn1::oid(PBMAC1) {
-        // RFC 9579: PBMAC1-params ::= SEQUENCE { keyDerivationFunc (PBKDF2),
-        // messageAuthScheme (hmacWithSHA*) }; the password as UTF-8.
-        let mut p = Reader::new(alg_params.unwrap_or(&[])).seq()?;
-        let (kdf, kdf_params) = p.alg_id()?;
-        let (scheme, _) = p.alg_id()?;
-        let h = Digest12::from_hmac_oid(scheme)
-            .ok_or_else(|| Error::Malformed("unsupported PBMAC1 MAC".into()))?;
-        if kdf != asn1::oid(PBKDF2) {
-            return bad("PBMAC1 with a KDF other than PBKDF2");
-        }
-        let key = pbkdf2_key(kdf_params, password.unwrap_or("").as_bytes(), h.len())?;
-        h.hmac(&key, auth_safe)
-    } else {
-        let d = Digest12::from_digest_oid(alg)
-            .ok_or_else(|| Error::Malformed("unsupported PKCS #12 MAC digest".into()))?;
-        let key = kdf12(d, 3, &bmp(password), salt, rounds, d.len());
-        d.hmac(&key, auth_safe)
-    };
-    // The comparison need not be constant-time: the MAC is over public
-    // data, and knowing it does not help guess the password.
-    if got != expected {
-        return Err(Error::BadPassword);
+    Ok(MacInfo {
+        alg,
+        alg_params,
+        expected,
+        salt,
+        rounds,
+    })
+}
+
+/// The MAC this file's scheme computes over the AuthenticatedSafe.
+fn mac_value(m: &MacInfo<'_>, password: Option<&str>, auth_safe: &[u8]) -> Result<Vec<u8>> {
+    if m.alg == asn1::oid(PBMAC1) {
+        return pbmac1_value(m.alg_params, password, auth_safe);
     }
-    Ok(())
+    let Some(digest) = Digest12::from_digest_oid(m.alg) else {
+        return Err(Error::Malformed("unsupported PKCS #12 MAC digest".into()));
+    };
+    let key = kdf12(digest, 3, &bmp(password), m.salt, m.rounds, digest.len());
+    Ok(digest.hmac(&key, auth_safe))
+}
+
+/// RFC 9579: `PBMAC1-params ::= SEQUENCE { keyDerivationFunc (PBKDF2), messageAuthScheme
+/// (hmacWithSHA*) }`, with the password as UTF-8 rather than as a BMPString.
+fn pbmac1_value(
+    params: Option<&[u8]>,
+    password: Option<&str>,
+    auth_safe: &[u8],
+) -> Result<Vec<u8>> {
+    let mut p = Reader::new(params.unwrap_or(&[])).seq()?;
+    let (kdf, kdf_params) = p.alg_id()?;
+    let (scheme, _) = p.alg_id()?;
+    let Some(digest) = Digest12::from_hmac_oid(scheme) else {
+        return Err(Error::Malformed("unsupported PBMAC1 MAC".into()));
+    };
+    if kdf != asn1::oid(PBKDF2) {
+        return bad("PBMAC1 with a KDF other than PBKDF2");
+    }
+    let key = pbkdf2_key(kdf_params, password.unwrap_or("").as_bytes(), digest.len())?;
+    Ok(digest.hmac(&key, auth_safe))
 }
 
 /// What a PKCS #12 file holds.
@@ -444,6 +542,14 @@ pub fn parse(data: &[u8], password: Option<&str>) -> Result<Contents> {
 
 /// `PFX ::= SEQUENCE { version 3, authSafe ContentInfo, macData OPTIONAL }`.
 fn parse_der(data: &[u8], password: Option<&str>) -> Result<Contents> {
+    let auth_safe = pfx_header(data, password)?;
+    let (keys, certs) = safes(auth_safe, password)?;
+    pair_up(keys, certs)
+}
+
+/// The `PFX` header: the version, the `authSafe` octets, and the MAC over them when the file
+/// carries one.
+fn pfx_header<'a>(data: &'a [u8], password: Option<&str>) -> Result<&'a [u8]> {
     let mut top = Reader::new(data);
     let mut pfx = top.seq()?;
     top.done("PFX")?;
@@ -459,84 +565,128 @@ fn parse_der(data: &[u8], password: Option<&str>) -> Result<Contents> {
         Some(mac) => check_mac(&der::tlv(der::SEQUENCE, mac), password, auth_safe)?,
         None => pfx.done("PFX")?,
     }
+    Ok(auth_safe)
+}
 
-    let mut keys: Vec<(Option<Vec<u8>>, PrivateKey)> = Vec::new();
-    let mut certs: Vec<(Option<Vec<u8>>, Cert)> = Vec::new();
+/// The keys and certificates of every safe, each with the `localKeyId` that pairs them.
+type Keys = Vec<(Option<Vec<u8>>, PrivateKey)>;
+type Certs = Vec<(Option<Vec<u8>>, Cert)>;
+
+/// Walks the `AuthenticatedSafe` and every bag it holds.
+///
+/// Bags this parser has no use for — CRLs, secrets, nested safes — are skipped rather than refused:
+/// a file may carry them and still hold the key and certificate somebody asked for.
+fn safes(auth_safe: &[u8], password: Option<&str>) -> Result<(Keys, Certs)> {
+    let mut keys: Keys = Vec::new();
+    let mut certs: Certs = Vec::new();
     let mut safes = Reader::new(auth_safe).seq()?;
     while !safes.is_empty() {
         let mut c = safes.seq()?;
         let ty = c.oid()?;
         let inner = c.expect(der::ctx(0))?;
-        let contents = if ty == asn1::oid(ID_DATA) {
-            Reader::new(inner).octets()?.to_vec()
-        } else if ty == asn1::oid(ID_ENCRYPTED_DATA) {
-            // EncryptedData ::= SEQUENCE { version, EncryptedContentInfo {
-            //     contentType, AlgorithmIdentifier, [0] IMPLICIT OCTET STRING } }
-            let mut ed = Reader::new(inner).seq()?;
-            ed.int()?;
-            let mut eci = ed.seq()?;
-            eci.oid()?;
-            let (alg, params) = eci.alg_id()?;
-            // [0] IMPLICIT OCTET STRING: primitive, or BER's constructed
-            // form with the string inside.
-            let enc = match eci.next()? {
-                (0x80, c) => c,
-                (0xA0, c) => Reader::new(c).octets()?,
-                _ => return bad("bad encryptedContent"),
-            };
-            decrypt(alg, params, password, enc)?
-        } else {
-            return bad("unsupported PKCS #12 content type");
+        let contents = safe_contents(ty, inner, password)?;
+        bags(&contents, password, &mut keys, &mut certs)?;
+    }
+    Ok((keys, certs))
+}
+
+/// The octets of one safe: plain, or decrypted with the password.
+fn safe_contents(ty: &[u8], inner: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
+    if ty == asn1::oid(ID_DATA) {
+        return Ok(Reader::new(inner).octets()?.to_vec());
+    }
+    if ty == asn1::oid(ID_ENCRYPTED_DATA) {
+        return encrypted_safe(inner, password);
+    }
+    bad("unsupported PKCS #12 content type")
+}
+
+/// `EncryptedData ::= SEQUENCE { version, EncryptedContentInfo { contentType,
+/// AlgorithmIdentifier, [0] IMPLICIT OCTET STRING } }`.
+fn encrypted_safe(inner: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
+    let mut ed = Reader::new(inner).seq()?;
+    ed.int()?;
+    let mut eci = ed.seq()?;
+    eci.oid()?;
+    let (alg, params) = eci.alg_id()?;
+    decrypt(alg, params, password, encrypted_content(&mut eci)?)
+}
+
+/// `[0] IMPLICIT OCTET STRING`: primitive, or BER's constructed form with the string inside.
+fn encrypted_content<'a>(eci: &mut Reader<'a>) -> Result<&'a [u8]> {
+    match eci.next()? {
+        (0x80, c) => Ok(c),
+        (0xA0, c) => Ok(Reader::new(c).octets()?),
+        _ => bad("bad encryptedContent"),
+    }
+}
+
+/// Every bag of one safe, added to `keys` or `certs` by type.
+fn bags(contents: &[u8], password: Option<&str>, keys: &mut Keys, certs: &mut Certs) -> Result<()> {
+    let mut bags = Reader::new(contents).seq()?;
+    while !bags.is_empty() {
+        let mut bag = bags.seq()?;
+        let id = bag.oid()?;
+        let value = bag.expect(der::ctx(0))?;
+        let local_id = match bag.optional(asn1::SET)? {
+            Some(attrs) => local_key_id(attrs)?,
+            None => None,
         };
-        let mut bags = Reader::new(&contents).seq()?;
-        while !bags.is_empty() {
-            let mut bag = bags.seq()?;
-            let id = bag.oid()?;
-            let value = bag.expect(der::ctx(0))?;
-            let local_id = match bag.optional(asn1::SET)? {
-                Some(attrs) => local_key_id(attrs)?,
-                None => None,
-            };
-            let is = |o: &str| id == asn1::oid(o);
-            if is(KEY_BAG) || is(SHROUDED_KEY_BAG) {
-                let pkcs8 = if is(KEY_BAG) {
-                    value.to_vec()
-                } else {
-                    // EncryptedPrivateKeyInfo ::= SEQUENCE { AlgorithmIdentifier, OCTET STRING }
-                    let mut e = Reader::new(value).seq()?;
-                    let (alg, params) = e.alg_id()?;
-                    decrypt(alg, params, password, e.octets()?)?
-                };
-                let key = PrivateKey::from_pem_blocks(&[("PRIVATE KEY".into(), pkcs8)])
-                    .map_err(|_| Error::BadPassword)?;
-                keys.push((local_id, key));
-            } else if is(CERT_BAG) {
-                // CertBag ::= SEQUENCE { certId, certValue [0] EXPLICIT }
-                let mut cb = Reader::new(value).seq()?;
-                if cb.oid()? != asn1::oid(X509_CERTIFICATE) {
-                    continue; // SDSI certificates
-                }
-                let der = Reader::new(cb.expect(der::ctx(0))?).octets()?;
-                certs.push((local_id, Cert::from_der(der)?));
-            }
-            // CRL, secret and nested bags are not needed here.
+        if let Some(key) = key_bag(id, value, password)? {
+            keys.push((local_id, key));
+        } else if let Some(cert) = cert_bag(id, value)? {
+            certs.push((local_id, cert));
         }
     }
+    Ok(())
+}
 
+/// The key a bag holds, if it holds one.
+fn key_bag(id: &[u8], value: &[u8], password: Option<&str>) -> Result<Option<PrivateKey>> {
+    let pkcs8 = if id == asn1::oid(KEY_BAG) {
+        value.to_vec()
+    } else if id == asn1::oid(SHROUDED_KEY_BAG) {
+        shrouded_key(value, password)?
+    } else {
+        return Ok(None);
+    };
+    let key = PrivateKey::from_pem_blocks(&[("PRIVATE KEY".into(), pkcs8)])
+        .map_err(|_| Error::BadPassword)?;
+    Ok(Some(key))
+}
+
+/// `EncryptedPrivateKeyInfo ::= SEQUENCE { AlgorithmIdentifier, OCTET STRING }`.
+fn shrouded_key(value: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
+    let mut e = Reader::new(value).seq()?;
+    let (alg, params) = e.alg_id()?;
+    decrypt(alg, params, password, e.octets()?)
+}
+
+/// The certificate a bag holds, if it holds one this parser reads.
+///
+/// A `CertBag` may hold an SDSI certificate, which nothing here understands; it is skipped.
+fn cert_bag(id: &[u8], value: &[u8]) -> Result<Option<Cert>> {
+    if id != asn1::oid(CERT_BAG) {
+        return Ok(None);
+    }
+    // CertBag ::= SEQUENCE { certId, certValue [0] EXPLICIT }
+    let mut cb = Reader::new(value).seq()?;
+    if cb.oid()? != asn1::oid(X509_CERTIFICATE) {
+        return Ok(None);
+    }
+    let der = Reader::new(cb.expect(der::ctx(0))?).octets()?;
+    Ok(Some(Cert::from_der(der)?))
+}
+
+/// The key, with the certificate that belongs to it first and the rest after.
+///
+/// OpenSSL's `PKCS12_parse` rule: the certificate whose `localKeyId` matches the key's, and failing
+/// that the one whose public key is the key's.
+fn pair_up(keys: Keys, mut certs: Certs) -> Result<Contents> {
     let Some((key_id, key)) = keys.into_iter().next() else {
         return bad("the PKCS #12 file holds no private key");
     };
-    // OpenSSL's PKCS12_parse: the certificate with the key's localKeyId,
-    // else the one whose public key is the key's.
-    let public = key.public();
-    let pos = certs
-        .iter()
-        .position(|(id, _)| key_id.is_some() && *id == key_id)
-        .or_else(|| {
-            certs
-                .iter()
-                .position(|(_, c)| c.public_key().ok().as_ref() == Some(&public))
-        })
+    let pos = matching_cert(&certs, key_id.as_deref(), &key)
         .ok_or_else(|| Error::Malformed("no certificate in the file matches its key".into()))?;
     let mine = certs.remove(pos).1;
     let mut all = vec![mine];
@@ -544,7 +694,20 @@ fn parse_der(data: &[u8], password: Option<&str>) -> Result<Contents> {
     Ok(Contents { certs: all, key })
 }
 
-/// A bag's `localKeyId` attribute, if any.
+/// Where the key's certificate sits in the file.
+fn matching_cert(certs: &Certs, key_id: Option<&[u8]>, key: &PrivateKey) -> Option<usize> {
+    let by_id = certs
+        .iter()
+        .position(|(id, _)| key_id.is_some() && id.as_deref() == key_id);
+    if by_id.is_some() {
+        return by_id;
+    }
+    let public = key.public();
+    certs
+        .iter()
+        .position(|(_, c)| c.public_key().ok().as_ref() == Some(&public))
+}
+
 fn local_key_id(attrs: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut r = Reader::new(attrs);
     while !r.is_empty() {
@@ -571,86 +734,160 @@ fn ber_to_der(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn ber_element(data: &[u8], depth: usize) -> Result<(Vec<u8>, &[u8])> {
+    let element = element(data, depth)?;
+    let rest = element.rest;
+    Ok((element.into_der()?, rest))
+}
+
+/// One BER element, read but not yet written back as DER.
+struct Element<'a> {
+    tag: u8,
+    /// The children of a constructed element, each already normalized.
+    children: Vec<Vec<u8>>,
+    /// The content of a primitive one.
+    content: Vec<u8>,
+    /// What follows the element in the input.
+    rest: &'a [u8],
+}
+
+/// Reads one element: its tag, its length, and either its content or its children.
+fn element(data: &[u8], depth: usize) -> Result<Element<'_>> {
     if depth > 64 {
         return bad("nesting too deep");
     }
+    let (tag, after_tag) = tagged(data)?;
+    let (length_byte, after_length) = length_byte(after_tag)?;
+    let constructed = tag & 0x20 != 0;
+    if length_byte == 0x80 {
+        let (children, rest) = indefinite_children(after_length, constructed, depth)?;
+        return Ok(Element {
+            tag,
+            children,
+            content: Vec::new(),
+            rest,
+        });
+    }
+    let (body, rest) = definite(after_length, length_byte)?;
+    let (children, content) = if constructed {
+        (children_of(body, depth)?, Vec::new())
+    } else {
+        (Vec::new(), body.to_vec())
+    };
+    Ok(Element {
+        tag,
+        children,
+        content,
+        rest,
+    })
+}
+
+/// A single-octet tag and what follows it.
+///
+/// A tag whose low five bits are all ones continues into the next octet, and nothing in a PKCS #12
+/// file needs one: refusing it keeps the length reading honest rather than one octet off.
+fn tagged(data: &[u8]) -> Result<(u8, &[u8])> {
     let (&tag, rest) = data
         .split_first()
         .ok_or_else(|| Error::Malformed("truncated BER".into()))?;
     if tag & 0x1F == 0x1F {
         return bad("multi-octet tag");
     }
-    let (&l0, mut rest) = rest
+    Ok((tag, rest))
+}
+
+/// The first length octet and what follows it.
+fn length_byte(data: &[u8]) -> Result<(u8, &[u8])> {
+    let (&byte, rest) = data
         .split_first()
         .ok_or_else(|| Error::Malformed("truncated BER".into()))?;
-    let constructed = tag & 0x20 != 0;
+    Ok((byte, rest))
+}
+
+/// The content of a definite-length element, and what follows it.
+fn definite(rest: &[u8], length_byte: u8) -> Result<(&[u8], &[u8])> {
+    let (len, rest) = length(rest, length_byte)?;
+    if rest.len() < len {
+        return bad("BER length overruns the data");
+    }
+    Ok(rest.split_at(len))
+}
+
+/// The length itself: short form, or long form counting the octets that carry it.
+fn length(rest: &[u8], length_byte: u8) -> Result<(usize, &[u8])> {
+    if length_byte < 0x80 {
+        return Ok((usize::from(length_byte), rest));
+    }
+    let k = usize::from(length_byte & 0x7F);
+    if k > 4 || rest.len() < k {
+        return bad("bad BER length");
+    }
+    let n = rest[..k]
+        .iter()
+        .fold(0usize, |a, &b| (a << 8) | usize::from(b));
+    Ok((n, &rest[k..]))
+}
+
+/// The children of a definite-length constructed element.
+fn children_of(body: &[u8], depth: usize) -> Result<Vec<Vec<u8>>> {
     let mut children = Vec::new();
-    let content: Vec<u8>;
-    if l0 == 0x80 {
-        if !constructed {
-            return bad("indefinite length on a primitive");
-        }
-        loop {
-            if rest.starts_with(&[0, 0]) {
-                rest = &rest[2..];
-                break;
-            }
-            let (child, r) = ber_element(rest, depth + 1)?;
-            children.push(child);
-            rest = r;
-        }
-        content = Vec::new();
-    } else {
-        let len = if l0 < 0x80 {
-            usize::from(l0)
-        } else {
-            let k = usize::from(l0 & 0x7F);
-            if k > 4 || rest.len() < k {
-                return bad("bad BER length");
-            }
-            let n = rest[..k]
-                .iter()
-                .fold(0usize, |a, &b| (a << 8) | usize::from(b));
-            rest = &rest[k..];
-            n
-        };
-        if rest.len() < len {
-            return bad("BER length overruns the data");
-        }
-        let (body, r) = rest.split_at(len);
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (child, r) = ber_element(rest, depth + 1)?;
+        children.push(child);
         rest = r;
-        if constructed {
-            let mut b = body;
-            while !b.is_empty() {
-                let (child, r) = ber_element(b, depth + 1)?;
-                children.push(child);
-                b = r;
-            }
-            content = Vec::new();
-        } else {
-            content = body.to_vec();
-        }
     }
+    Ok(children)
+}
+
+/// The children of an indefinite-length element, up to the end-of-contents octets.
+fn indefinite_children(
+    rest: &[u8],
+    constructed: bool,
+    depth: usize,
+) -> Result<(Vec<Vec<u8>>, &[u8])> {
     if !constructed {
-        return Ok((der::tlv(tag, &content), rest));
+        return bad("indefinite length on a primitive");
     }
-    // A constructed OCTET STRING, or a constructed [0] made only of OCTET
-    // STRING pieces (encryptedContent), is joined into a primitive one.
-    let all_strings = !children.is_empty() && children.iter().all(|c| c[0] == der::OCTET_STRING);
-    let joined = |children: &[Vec<u8>]| -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        for c in children {
-            out.extend_from_slice(Reader::new(c).octets()?);
+    let mut children = Vec::new();
+    let mut rest = rest;
+    loop {
+        if rest.starts_with(&[0, 0]) {
+            return Ok((children, &rest[2..]));
         }
-        Ok(out)
-    };
-    if tag == 0x24 {
-        return Ok((der::tlv(der::OCTET_STRING, &joined(&children)?), rest));
+        let (child, r) = ber_element(rest, depth + 1)?;
+        children.push(child);
+        rest = r;
     }
-    if tag == 0xA0 && all_strings && children.len() > 1 {
-        return Ok((der::tlv(0x80, &joined(&children)?), rest));
+}
+
+impl Element<'_> {
+    /// The element as DER: lengths minimal, and the two constructed forms this format uses
+    /// flattened into primitive ones.
+    fn into_der(self) -> Result<Vec<u8>> {
+        if self.tag & 0x20 == 0 {
+            return Ok(der::tlv(self.tag, &self.content));
+        }
+        // A constructed OCTET STRING, or a constructed [0] made only of OCTET STRING pieces
+        // (encryptedContent), is joined into a primitive one.
+        let all_strings =
+            !self.children.is_empty() && self.children.iter().all(|c| c[0] == der::OCTET_STRING);
+        if self.tag == 0x24 {
+            return Ok(der::tlv(der::OCTET_STRING, &joined(&self.children)?));
+        }
+        if self.tag == 0xA0 && all_strings && self.children.len() > 1 {
+            return Ok(der::tlv(0x80, &joined(&self.children)?));
+        }
+        Ok(der::cons(self.tag, &self.children))
     }
-    Ok((der::cons(tag, &children), rest))
+}
+
+/// The contents of OCTET STRING children, one after another.
+fn joined(children: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for c in children {
+        out.extend_from_slice(Reader::new(c).octets()?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

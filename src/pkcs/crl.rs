@@ -365,37 +365,45 @@ fn check_cert(
     sent: &[Crl],
     now: i64,
 ) -> Result<()> {
-    let at = |what: &str| {
-        DerError(format!(
-            "certificate at depth {depth} of the KDC's chain: {what}"
-        ))
+    let Some((score, crl)) = best_crl(cert, issuer, policy, sent, now) else {
+        // No CRL at all is only a failure when the configuration asks for one: an unreachable
+        // distribution point is how most realms run.
+        return match policy.require {
+            true => at(
+                depth,
+                "no CRL from its issuer (pkinit_require_crl_checking)",
+            ),
+            false => Ok(()),
+        };
     };
+    check_selected(cert, issuer, depth, score, crl, now)
+}
+
+/// A refusal naming where in the chain it happened.
+fn at<T>(depth: usize, what: &str) -> Result<T> {
+    Err(DerError(format!(
+        "certificate at depth {depth} of the KDC's chain: {what}"
+    )))
+}
+
+/// The CRL to judge `cert` by: OpenSSL's `get_crl_sk`, the best score with a later `thisUpdate`
+/// taking a tie.
+fn best_crl<'a>(
+    cert: &Cert,
+    issuer: &Cert,
+    policy: Policy<'a>,
+    sent: &'a [Crl],
+    now: i64,
+) -> Option<(u32, &'a Crl)> {
     let ski = issuer
         .extension(SUBJECT_KEY_IDENTIFIER)
         .and_then(|e| Reader::new(&e.value).octets().ok());
-    // OpenSSL's get_crl_sk: the best score, a later thisUpdate taking a tie.
     let mut best: Option<(u32, &Crl)> = None;
     for crl in policy.local.iter().chain(sent) {
-        if crl.unusable || crl.issuer != cert.issuer {
+        if !usable_for(crl, cert, ski) {
             continue;
         }
-        // An authorityKeyIdentifier naming another key: some other
-        // issuer's CRL (a re-keyed CA), not this one's.
-        if let (Some(a), Some(s)) = (&crl.akid, ski)
-            && a.as_slice() != s
-        {
-            continue;
-        }
-        let mut score = 0;
-        if !crl.unhandled_critical {
-            score |= SCORE_NOCRITICAL;
-        }
-        if in_scope(cert, crl) {
-            score |= SCORE_SCOPE;
-        }
-        if crl.current(now) {
-            score |= SCORE_TIME;
-        }
+        let score = score_of(cert, crl, now);
         best = match best {
             Some((b, c)) if score < b || (score == b && crl.this_update <= c.this_update) => {
                 Some((b, c))
@@ -403,35 +411,75 @@ fn check_cert(
             _ => Some((score, crl)),
         };
     }
-    let Some((score, crl)) = best else {
-        return match policy.require {
-            true => Err(at("no CRL from its issuer (pkinit_require_crl_checking)")),
-            false => Ok(()),
-        };
-    };
-    // OpenSSL's check_crl, then cert_crl.
+    best
+}
+
+/// Whether this CRL could be the one for `cert`: from its issuer, not superseded, and not naming
+/// another key.
+///
+/// An `authorityKeyIdentifier` that names a different key is some other issuer's CRL — a CA that
+/// re-keyed — rather than this one's, and judging a certificate by it would report a revocation
+/// that never happened.
+fn usable_for(crl: &Crl, cert: &Cert, ski: Option<&[u8]>) -> bool {
+    if crl.unusable || crl.issuer != cert.issuer {
+        return false;
+    }
+    match (&crl.akid, ski) {
+        (Some(a), Some(s)) => a.as_slice() == s,
+        _ => true,
+    }
+}
+
+/// OpenSSL's score for a candidate: the bits, in its order of preference.
+fn score_of(cert: &Cert, crl: &Crl, now: i64) -> u32 {
+    let mut score = 0;
+    if !crl.unhandled_critical {
+        score |= SCORE_NOCRITICAL;
+    }
+    if in_scope(cert, crl) {
+        score |= SCORE_SCOPE;
+    }
+    if crl.current(now) {
+        score |= SCORE_TIME;
+    }
+    score
+}
+
+/// OpenSSL's `check_crl` and then `cert_crl`, in the order it makes its refusals.
+fn check_selected(
+    cert: &Cert,
+    issuer: &Cert,
+    depth: usize,
+    score: u32,
+    crl: &Crl,
+    now: i64,
+) -> Result<()> {
     if issuer.key_usage(KU_CRL_SIGN)? == Some(false) {
-        return Err(at("its CRL's issuer may not sign CRLs (keyUsage)"));
+        return at(depth, "its CRL's issuer may not sign CRLs (keyUsage)");
     }
     if score & SCORE_SCOPE == 0 {
-        return Err(at(
+        return at(
+            depth,
             "its issuer's CRL does not cover it (issuingDistributionPoint)",
-        ));
+        );
     }
     if crl.this_update > now {
-        return Err(at("its issuer's CRL is not yet valid"));
+        return at(depth, "its issuer's CRL is not yet valid");
     }
     if crl.next_update.is_some_and(|n| now > n) {
-        return Err(at("its issuer's CRL has expired"));
+        return at(depth, "its issuer's CRL has expired");
     }
     if !issuer.made(&crl.sig_alg, &crl.tbs, &crl.signature) {
-        return Err(at("its issuer's CRL is not signed by the issuer"));
+        return at(depth, "its issuer's CRL is not signed by the issuer");
     }
     if crl.unhandled_critical {
-        return Err(at("its issuer's CRL has an unhandled critical extension"));
+        return at(
+            depth,
+            "its issuer's CRL has an unhandled critical extension",
+        );
     }
     if crl.revoked.contains(&cert.serial) {
-        return Err(at("revoked"));
+        return at(depth, "revoked");
     }
     Ok(())
 }
