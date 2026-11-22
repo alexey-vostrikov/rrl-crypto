@@ -561,11 +561,19 @@ fn pfx_header<'a>(data: &'a [u8], password: Option<&str>) -> Result<&'a [u8]> {
         return bad("PKCS #12 with public-key integrity mode is not supported");
     }
     let auth_safe = Reader::new(ci.expect(der::ctx(0))?).octets()?;
-    match pfx.optional(der::SEQUENCE)? {
-        Some(mac) => check_mac(&der::tlv(der::SEQUENCE, mac), password, auth_safe)?,
-        None => pfx.done("PFX")?,
-    }
+    check_integrity(&mut pfx, password, auth_safe)?;
     Ok(auth_safe)
+}
+
+/// The MAC over the AuthenticatedSafe, when the file states one.
+///
+/// A file without a MAC is legal — OpenSSL writes one, but the format does not require it — and then
+/// there is nothing to check the password against here; the encrypted bags are what refuse it.
+fn check_integrity(pfx: &mut Reader<'_>, password: Option<&str>, auth_safe: &[u8]) -> Result<()> {
+    match pfx.optional(der::SEQUENCE)? {
+        Some(mac) => check_mac(&der::tlv(der::SEQUENCE, mac), password, auth_safe),
+        None => Ok(pfx.done("PFX")?),
+    }
 }
 
 /// The keys and certificates of every safe, each with the `localKeyId` that pairs them.
@@ -626,17 +634,35 @@ fn bags(contents: &[u8], password: Option<&str>, keys: &mut Keys, certs: &mut Ce
     let mut bags = Reader::new(contents).seq()?;
     while !bags.is_empty() {
         let mut bag = bags.seq()?;
-        let id = bag.oid()?;
+        let id = bag.oid()?.to_vec();
         let value = bag.expect(der::ctx(0))?;
-        let local_id = match bag.optional(asn1::SET)? {
-            Some(attrs) => local_key_id(attrs)?,
-            None => None,
-        };
-        if let Some(key) = key_bag(id, value, password)? {
-            keys.push((local_id, key));
-        } else if let Some(cert) = cert_bag(id, value)? {
-            certs.push((local_id, cert));
-        }
+        let (local_id, value) = (local_key_id_of(&mut bag)?, value);
+        one_bag(&id, value, local_id, password, keys, certs)?;
+    }
+    Ok(())
+}
+
+/// The `localKeyId` a bag's attributes carry, when it has attributes.
+fn local_key_id_of(bag: &mut Reader<'_>) -> Result<Option<Vec<u8>>> {
+    match bag.optional(asn1::SET)? {
+        Some(attrs) => local_key_id(attrs),
+        None => Ok(None),
+    }
+}
+
+/// Files one bag under the key or certificate it holds.
+fn one_bag(
+    id: &[u8],
+    value: &[u8],
+    local_id: Option<Vec<u8>>,
+    password: Option<&str>,
+    keys: &mut Keys,
+    certs: &mut Certs,
+) -> Result<()> {
+    if let Some(key) = key_bag(id, value, password)? {
+        keys.push((local_id, key));
+    } else if let Some(cert) = cert_bag(id, value)? {
+        certs.push((local_id, cert));
     }
     Ok(())
 }

@@ -159,40 +159,63 @@ impl std::fmt::Debug for PrivateKey {
     }
 }
 
+/// The scalar and the curve a SEC 1 `ECPrivateKey` states.
+///
+/// The curve field is optional here and may also arrive from outside — a PKCS #8 wrapper names it —
+/// which is why the two are read apart and reconciled by `curve_of`.
+fn sec1_parts(der: &[u8]) -> Result<(Vec<u8>, Option<Curve>)> {
+    let mut r = Reader::new(der);
+    let mut s = r.seq()?;
+    r.done("ECPrivateKey")?;
+    if s.int()? != 1 {
+        return Err(DerError("unsupported ECPrivateKey version".into()));
+    }
+    let scalar = s.octets()?.to_vec();
+    let inner = match s.optional(der::ctx(0))? {
+        Some(p) => Some(Curve::from_params(Some(p))?),
+        None => None,
+    };
+    Ok((scalar, inner))
+}
+
+/// The curve both halves agree on, or a refusal when they do not.
+///
+/// A key whose two curve statements disagree is not a key with a preferred curve: one of the two is
+/// wrong, and a signature made under the wrong one verifies nowhere.
+fn curve_of(outer: Option<Curve>, inner: Option<Curve>) -> Result<Curve> {
+    match (outer, inner) {
+        (Some(a), Some(b)) if a != b => Err(DerError("EC key's curves disagree".into())),
+        (Some(c), _) | (None, Some(c)) => Ok(c),
+        (None, None) => Err(DerError("EC key without a named curve".into())),
+    }
+}
+
+/// The scalar at the curve's width.
+///
+/// Some writers drop leading zeros of the scalar, so the bytes arrive short and are padded on the
+/// left; a scalar longer than the field is not a padded one but a wrong one.
+fn scalar_of(scalar: &[u8], curve: Curve) -> Result<Vec<u8>> {
+    if scalar.len() > curve.field_len() {
+        return Err(DerError("EC private key too long".into()));
+    }
+    let mut padded = vec![0; curve.field_len() - scalar.len()];
+    padded.extend_from_slice(scalar);
+    Ok(padded)
+}
+
 impl PrivateKey {
     /// SEC1 `ECPrivateKey ::= SEQUENCE { version 1, privateKey OCTET
     /// STRING, parameters [0] OPTIONAL, publicKey [1] OPTIONAL }` (PEM `EC
     /// PRIVATE KEY`, or inside PKCS #8, whose AlgorithmIdentifier gives the
     /// curve as `outer`).
     pub fn from_sec1(der: &[u8], outer: Option<Curve>) -> Result<PrivateKey> {
-        let mut r = Reader::new(der);
-        let mut s = r.seq()?;
-        r.done("ECPrivateKey")?;
-        if s.int()? != 1 {
-            return Err(DerError("unsupported ECPrivateKey version".into()));
-        }
-        let d = s.octets()?;
-        let inner = match s.optional(der::ctx(0))? {
-            Some(p) => Some(Curve::from_params(Some(p))?),
-            None => None,
-        };
-        let curve = match (outer, inner) {
-            (Some(a), Some(b)) if a != b => {
-                return Err(DerError("EC key's curves disagree".into()));
-            }
-            (Some(c), _) | (None, Some(c)) => c,
-            (None, None) => return Err(DerError("EC key without a named curve".into())),
-        };
-        // Some writers drop leading zeros of the scalar.
-        if d.len() > curve.field_len() {
-            return Err(DerError("EC private key too long".into()));
-        }
-        let mut padded = vec![0; curve.field_len() - d.len()];
-        padded.extend_from_slice(d);
-        let point = curve.public_point(&padded)?;
+        let (scalar, inner) = sec1_parts(der)?;
+        let curve = curve_of(outer, inner)?;
+        let d = scalar_of(&scalar, curve)?;
+        let point = curve.public_point(&d)?;
         Ok(PrivateKey {
             public: PublicKey { curve, point },
-            d: padded,
+            d,
         })
     }
 

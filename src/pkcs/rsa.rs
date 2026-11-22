@@ -125,6 +125,33 @@ impl std::fmt::Debug for PrivateKey {
     }
 }
 
+/// The key inside a PKCS #8 wrapper.
+fn pkcs8_inner(s: &mut Reader<'_>) -> Result<PrivateKey, DerError> {
+    let (alg, _) = s.alg_id()?;
+    if alg != asn1::oid(RSA_ENCRYPTION) {
+        return Err(DerError(
+            "the private key is not RSA (only RSA keys are supported)".into(),
+        ));
+    }
+    PrivateKey::from_der(s.octets()?)
+}
+
+/// The key in its own `RSAPrivateKey`: `n`, `e`, `d`, and the CRT parameters nothing here uses.
+fn pkcs1_inner(s: &mut Reader<'_>) -> Result<PrivateKey, DerError> {
+    let n = s.uint()?.to_vec();
+    let e = s.uint()?.to_vec();
+    let d = s.uint()?.to_vec();
+    let public = PublicKey::from_der(&der::seq(&[asn1::uint(&n), asn1::uint(&e)]))?;
+    if d.is_empty() || !less(&d, &public.n) {
+        return Err(DerError("bad RSA private exponent".into()));
+    }
+    // `d` is padded to the modulus length, so the exponentiation's time says nothing about its
+    // length.
+    let mut padded = vec![0; public.n.len() - d.len()];
+    padded.extend_from_slice(&d);
+    Ok(PrivateKey { public, d: padded })
+}
+
 impl PrivateKey {
     /// PKCS #1 `RSAPrivateKey` (PEM `RSA PRIVATE KEY`) or a PKCS #8
     /// `PrivateKeyInfo` holding one (PEM `PRIVATE KEY`, what `openssl req
@@ -134,28 +161,12 @@ impl PrivateKey {
         let mut s = r.seq()?;
         r.done("private key")?;
         s.uint()?; // version
-        // PKCS #8: AlgorithmIdentifier, then the key in an OCTET STRING.
+        // PKCS #8 wraps the same structure: AlgorithmIdentifier, then the key in an OCTET STRING.
         if s.rest().first() == Some(&der::SEQUENCE) {
-            let (alg, _) = s.alg_id()?;
-            if alg != asn1::oid(RSA_ENCRYPTION) {
-                return Err(DerError(
-                    "the private key is not RSA (only RSA keys are supported)".into(),
-                ));
-            }
-            return PrivateKey::from_der(s.octets()?);
+            pkcs8_inner(&mut s)
+        } else {
+            pkcs1_inner(&mut s)
         }
-        let n = s.uint()?.to_vec();
-        let e = s.uint()?.to_vec();
-        let d = s.uint()?.to_vec();
-        let public = PublicKey::from_der(&der::seq(&[asn1::uint(&n), asn1::uint(&e)]))?;
-        if d.is_empty() || !less(&d, &public.n) {
-            return Err(DerError("bad RSA private exponent".into()));
-        }
-        // d is padded to the modulus length, so the exponentiation's time
-        // says nothing about d's length.
-        let mut padded = vec![0; public.n.len() - d.len()];
-        padded.extend_from_slice(&d);
-        Ok(PrivateKey { public, d: padded })
     }
 
     pub fn public(&self) -> &PublicKey {

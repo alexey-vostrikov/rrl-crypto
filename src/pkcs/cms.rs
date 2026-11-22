@@ -630,6 +630,28 @@ fn signer_info<'a>(
 ) -> Result<SignerInfo<'a>> {
     let mut si = Reader::new(signer).seq()?;
     si.int()?; // version
+    let fields = signer_parts(&mut si, certs)?;
+    signed_attributes(fields.attrs, content_type, content, fields.hash)?;
+    Ok(SignerInfo {
+        index: fields.index,
+        hash: fields.hash,
+        alg: fields.alg,
+        attrs: fields.attrs,
+        signature: fields.signature,
+    })
+}
+
+/// The `SignerInfo` fields read before the content is known.
+struct SignerFields<'a> {
+    index: usize,
+    hash: Hash,
+    attrs: &'a [u8],
+    alg: SigAlg,
+    signature: Vec<u8>,
+}
+
+/// The `SignerInfo` fields that do not depend on the content it signs.
+fn signer_parts<'a>(si: &mut Reader<'a>, certs: &[Cert]) -> Result<SignerFields<'a>> {
     // `SignerIdentifier ::= CHOICE { issuerAndSerialNumber SEQUENCE, subjectKeyIdentifier [0] }`.
     // Heimdal signs with the key identifier and MIT with the issuer and serial — both are legal,
     // and a verifier that knows only one of them interops with only one of them.
@@ -647,12 +669,11 @@ fn signer_info<'a>(
     let signature = si.octets()?.to_vec();
     si.optional(der::ctx(1))?; // unsignedAttrs
     si.done("SignerInfo")?;
-    signed_attributes(attrs, content_type, content, hash)?;
-    Ok(SignerInfo {
+    Ok(SignerFields {
         index,
         hash,
-        alg,
         attrs,
+        alg,
         signature,
     })
 }

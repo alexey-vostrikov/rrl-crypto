@@ -150,6 +150,28 @@ struct Entry {
     unhandled_critical: bool,
 }
 
+impl Entry {
+    /// Reads the extensions that say a certificate is back, or that go unhandled.
+    ///
+    /// `reasonCode`'s `removeFromCRL` is the one reason that changes the verdict: an entry is
+    /// otherwise a revocation, and the date in it says when. A critical extension this crate does
+    /// not interpret is remembered rather than refused here — the refusal belongs to whoever judges
+    /// the certificate, where it can name the depth.
+    fn read_extensions(&mut self, extensions: Vec<x509::Extension>) -> Result<()> {
+        for x in extensions {
+            if x.oid == asn1::oid(REASON_CODE) {
+                self.removed = Reader::new(&x.value).expect(ENUMERATED)? == [REMOVE_FROM_CRL];
+            }
+            // OpenSSL handles a critical certificateIssuer (it matters only to indirect CRLs) and
+            // no other.
+            if x.critical && x.oid != asn1::oid(CERTIFICATE_ISSUER) {
+                self.unhandled_critical = true;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The `SEQUENCE OF` revoked entries.
 fn revoked_entries(t: &mut Reader<'_>, version: i64) -> Result<Vec<Entry>> {
     let mut entries = t.seq()?;
@@ -178,16 +200,7 @@ fn entry(entries: &mut Reader<'_>, version: i64) -> Result<Entry> {
         return err("entry extensions in a CRL before v2");
     }
     let (_, _, raw) = e.next_raw()?;
-    for x in x509::read_extensions(raw)? {
-        if x.oid == asn1::oid(REASON_CODE) {
-            out.removed = Reader::new(&x.value).expect(ENUMERATED)? == [REMOVE_FROM_CRL];
-        }
-        // OpenSSL handles a critical certificateIssuer (it matters only to indirect CRLs) and no
-        // other.
-        if x.critical && x.oid != asn1::oid(CERTIFICATE_ISSUER) {
-            out.unhandled_critical = true;
-        }
-    }
+    out.read_extensions(x509::read_extensions(raw)?)?;
     e.done("revokedCertificate")?;
     Ok(out)
 }
