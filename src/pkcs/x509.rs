@@ -82,29 +82,46 @@ pub(super) struct Extension {
 /// `Extensions ::= SEQUENCE OF Extension`, from the SEQUENCE's encoding.
 /// An extension may appear only once (RFC 5280 §4.2, §5.2).
 pub(super) fn read_extensions(exts: &[u8]) -> Result<Vec<Extension>> {
-    let mut extensions = Vec::new();
+    let mut extensions: Vec<Extension> = Vec::new();
     let mut seq = Reader::new(exts).seq()?;
     while !seq.is_empty() {
-        let mut e = seq.seq()?;
-        let oid = e.oid()?.to_vec();
-        let critical = match e.optional(asn1::BOOLEAN)? {
-            Some([0xFF]) => true,
-            Some([0x00]) => return err("DEFAULT FALSE encoded (not DER)"),
-            Some(_) => return err("bad BOOLEAN"),
-            None => false,
-        };
-        let value = e.octets()?.to_vec();
-        e.done("Extension")?;
-        if extensions.iter().any(|x: &Extension| x.oid == oid) {
+        let x = read_extension(&mut seq)?;
+        // RFC 5280: an extension appears at most once, and a second copy is not a repeated
+        // statement but a file that says two different things.
+        if extensions.iter().any(|e| e.oid == x.oid) {
             return err("an extension appears twice");
         }
-        extensions.push(Extension {
-            oid,
-            critical,
-            value,
-        });
+        extensions.push(x);
     }
     Ok(extensions)
+}
+
+/// One `Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }`.
+fn read_extension(seq: &mut Reader<'_>) -> Result<Extension> {
+    let mut e = seq.seq()?;
+    let oid = e.oid()?.to_vec();
+    let critical = critical_of(&mut e)?;
+    let value = e.octets()?.to_vec();
+    e.done("Extension")?;
+    Ok(Extension {
+        oid,
+        critical,
+        value,
+    })
+}
+
+/// The `critical` flag, which DER leaves out when it is false.
+///
+/// An explicit `FALSE` is refused rather than read as false: DER says a default value is never
+/// encoded, so a file that writes it was produced by something that does not follow DER, and the
+/// rest of its encoding cannot be trusted either.
+fn critical_of(e: &mut Reader<'_>) -> Result<bool> {
+    match e.optional(asn1::BOOLEAN)? {
+        Some([0xFF]) => Ok(true),
+        Some([0x00]) => err("DEFAULT FALSE encoded (not DER)"),
+        Some(_) => err("bad BOOLEAN"),
+        None => Ok(false),
+    }
 }
 
 /// The three parts a certificate is signed over, and the signature itself.

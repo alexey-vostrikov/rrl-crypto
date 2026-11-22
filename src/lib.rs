@@ -994,4 +994,126 @@ mod tests {
         // The empty input is `d41d8cd9...`, which is what a caller that passed no parts would get.
         assert_eq!(md5_parts(&[]), md5(b""));
     }
+
+    /// The trait's own `verify_checksum`, which a backend had written out again.
+    ///
+    /// The copy in `rskrb5_backend` was byte for byte this body, so it was removed: a check that
+    /// lives in one place is a check whose refusals are the same everywhere. Testing the default
+    /// needs an implementor that does not override it — `OwnCipher` does, to derive the key itself —
+    /// so this one forwards every required method and inherits the check.
+    ///
+    /// What it establishes: a right tag passes, a wrong one is refused, and every octet matters,
+    /// not just the last — a comparison that stopped early would accept a tag right for its first
+    /// half.
+    /// An implementor that forwards every required method and inherits `verify_checksum`.
+    #[derive(Debug)]
+    struct Inherits(OwnCipher);
+
+    impl Cipher for Inherits {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn random(&self, enctype: Enctype) -> Result<Key> {
+            self.0.random(enctype)
+        }
+
+        fn s2k(
+            &self,
+            enctype: Enctype,
+            password: &[u8],
+            salt: &[u8],
+            params: Option<&[u8]>,
+        ) -> Result<Key> {
+            self.0.s2k(enctype, password, salt, params)
+        }
+
+        fn derive_key(
+            &self,
+            enctype: Enctype,
+            base: &[u8],
+            usage: u32,
+            use_: KeyUse,
+        ) -> Result<Vec<u8>> {
+            self.0.derive_key(enctype, base, usage, use_)
+        }
+
+        fn encrypt(&self, key: &Key, usage: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
+            self.0.encrypt(key, usage, plaintext)
+        }
+
+        fn encrypt_with_confounder(
+            &self,
+            key: &Key,
+            usage: u32,
+            plaintext: &[u8],
+            confounder: &[u8],
+        ) -> Result<Vec<u8>> {
+            self.0
+                .encrypt_with_confounder(key, usage, plaintext, confounder)
+        }
+
+        fn decrypt(&self, key: &Key, usage: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+            self.0.decrypt(key, usage, ciphertext)
+        }
+
+        fn checksum(&self, key: &Key, usage: u32, data: &[u8]) -> Result<Vec<u8>> {
+            self.0.checksum(key, usage, data)
+        }
+    }
+
+    #[test]
+    fn the_default_checksum_check_compares_the_whole_tag() {
+        let cipher = Inherits(OwnCipher);
+        let key = Key::new(Enctype::Aes256Sha384, vec![0x11; 32]).expect("a 256-bit key");
+        let data = b"a message the checksum covers";
+        let usage = 3;
+
+        let tag = cipher.checksum(&key, usage, data).expect("a checksum");
+        cipher
+            .verify_checksum(&key, usage, data, &tag)
+            .expect("the right tag passes");
+
+        for at in [0, tag.len() / 2, tag.len() - 1] {
+            let mut wrong = tag.clone();
+            wrong[at] ^= 0x01;
+            let e = cipher
+                .verify_checksum(&key, usage, data, &wrong)
+                .expect_err("a wrong tag must be refused");
+            assert!(e.to_string().contains("checksum mismatch"), "{e}");
+        }
+        assert!(
+            cipher
+                .verify_checksum(&key, usage, b"another message", &tag)
+                .is_err()
+        );
+    }
+
+    /// The same statement about the backend this crate ships, which derives the key itself.
+    #[test]
+    fn the_ciphers_checksum_check_refuses_a_wrong_tag() {
+        let cipher = OwnCipher;
+        let key = Key::new(Enctype::Aes256Sha384, vec![0x11; 32]).expect("a 256-bit key");
+        let data = b"a message the checksum covers";
+        let usage = 3;
+
+        let tag = cipher.checksum(&key, usage, data).expect("a checksum");
+        cipher
+            .verify_checksum(&key, usage, data, &tag)
+            .expect("the right tag passes");
+
+        for at in [0, tag.len() / 2, tag.len() - 1] {
+            let mut wrong = tag.clone();
+            wrong[at] ^= 0x01;
+            let e = cipher
+                .verify_checksum(&key, usage, data, &wrong)
+                .expect_err("a wrong tag must be refused");
+            assert!(e.to_string().contains("does not verify"), "{e}");
+        }
+        assert!(
+            cipher
+                .verify_checksum(&key, usage, b"another message", &tag)
+                .is_err()
+        );
+    }
 }

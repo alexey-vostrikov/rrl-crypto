@@ -1139,4 +1139,46 @@ mod tests {
         let mut r = Reader::new(elems[1]);
         assert_eq!(r.string().unwrap(), "b");
     }
+
+    /// `Fields::u32` was at zero: every message field of that type was read by a fixture that
+    /// happened to be well formed, so the refusal paths — a value too large, a value with the wrong
+    /// tag — had never run. A `UInt32` in a Kerberos message is a nonce or a small count, and one
+    /// that arrives negative or too large is a message from something that is not a KDC.
+    #[test]
+    fn a_u32_field_refuses_what_is_not_a_u32() {
+        // `[7] INTEGER 4294967295`, the largest value that fits.
+        let biggest = field_bytes(7, &int(4_294_967_295));
+        let f = Fields::parse("T", &biggest).expect("parses");
+        assert_eq!(f.u32(7, "T").expect("a u32"), 4_294_967_295);
+
+        // One more than fits.
+        let too_big = field_bytes(7, &int(4_294_967_296));
+        let f = Fields::parse("T", &too_big).expect("parses");
+        assert!(f.u32(7, "T").is_err(), "4294967296 does not fit");
+
+        // A negative Int32 is read as its two's-complement `UInt32`, which is what MIT writes for
+        // the top half of the range: `-1` is 4294967295, not a refusal. The range check below the
+        // sign is the one that matters.
+        let negative = field_bytes(7, &int(-1));
+        let f = Fields::parse("T", &negative).expect("parses");
+        assert_eq!(
+            f.u32(7, "T").expect("a u32"),
+            u32::MAX,
+            "-1 is 4294967295 here"
+        );
+
+        // Below `i32::MIN` is neither encoding.
+        let underflow = field_bytes(7, &int(i64::from(i32::MIN) - 1));
+        let f = Fields::parse("T", &underflow).expect("parses");
+        assert!(f.u32(7, "T").is_err(), "below i32::MIN is out of range");
+
+        // Absent.
+        let f = Fields::parse("T", &[]).expect("parses");
+        assert!(f.u32(7, "T").is_err(), "an absent field is not zero");
+    }
+
+    /// A `[n]` field holding `content`.
+    fn field_bytes(n: u8, content: &[u8]) -> Vec<u8> {
+        tlv(ctx(n), content)
+    }
 }

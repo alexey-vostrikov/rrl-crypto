@@ -173,6 +173,23 @@ pub fn decrypt(enctype: Enctype, ke: &[u8], ki: &[u8], ciphertext: &[u8]) -> Res
     check_ke(enctype, ke)?;
     check_ki(enctype, ki)?;
     let mac_len = enctype.mac_len();
+    let (cipher, tag) = split_tag(enctype, ciphertext, mac_len)?;
+    let plain = open(enctype, ke, ki, cipher, tag, mac_len)?;
+    // The confounder is there so that two encryptions of the same plaintext differ; it is not part
+    // of what the caller asked for, and a plaintext shorter than it means the key was wrong.
+    if plain.len() < enctype.confounder_len() {
+        return Err(Error::crypto(
+            "decrypted plaintext is shorter than the confounder",
+        ));
+    }
+    Ok(plain[enctype.confounder_len()..].to_vec())
+}
+
+/// The ciphertext and its tag: the tag is the last `mac_len` octets.
+///
+/// A ciphertext shorter than a block plus a tag cannot be one: the confounder alone is a block, and
+/// the tag has to follow it.
+fn split_tag(enctype: Enctype, ciphertext: &[u8], mac_len: usize) -> Result<(&[u8], &[u8])> {
     if ciphertext.len() < BLOCK + mac_len {
         return Err(Error::crypto(format!(
             "ciphertext is {} octets; {} needs at least {}",
@@ -181,38 +198,51 @@ pub fn decrypt(enctype: Enctype, ke: &[u8], ki: &[u8], ciphertext: &[u8]) -> Res
             BLOCK + mac_len
         )));
     }
-    let (cipher, tag) = ciphertext.split_at(ciphertext.len() - mac_len);
+    Ok(ciphertext.split_at(ciphertext.len() - mac_len))
+}
 
-    let plain = match enctype.sha2_kind() {
-        // The tag covers the plaintext, so it can only be checked after decrypting.
+/// The plaintext with its confounder: integrity first where the enctype allows it.
+///
+/// The two SHA-2 enctypes (RFC 8009) MAC `IV | C`, so a forged ciphertext never reaches the block
+/// cipher; the SHA-1 ones (RFC 3962) MAC the plaintext, so they have to decrypt first and check
+/// after.
+fn open(
+    enctype: Enctype,
+    ke: &[u8],
+    ki: &[u8],
+    cipher: &[u8],
+    tag: &[u8],
+    mac_len: usize,
+) -> Result<Vec<u8>> {
+    match enctype.sha2_kind() {
         None => {
             let plain = aes_cts::decrypt(ke, &ZERO_IV, cipher)?;
-            let expect = hmac(enctype, ki, &plain)?;
-            if !ct_eq(&expect[..mac_len], tag) {
-                return Err(Error::crypto("integrity check failed"));
-            }
-            plain
+            check_tag(enctype, ki, &plain, tag, mac_len)?;
+            Ok(plain)
         }
-        // The tag covers `IV | C`: integrity is established before anything is decrypted, so a
-        // forged ciphertext never reaches the block cipher.
         Some(_) => {
             let mut macced = Vec::with_capacity(BLOCK + cipher.len());
             macced.extend_from_slice(&ZERO_IV);
             macced.extend_from_slice(cipher);
-            let expect = hmac(enctype, ki, &macced)?;
-            if !ct_eq(&expect[..mac_len], tag) {
-                return Err(Error::crypto("integrity check failed"));
-            }
-            aes_cts::decrypt(ke, &ZERO_IV, cipher)?
+            check_tag(enctype, ki, &macced, tag, mac_len)?;
+            aes_cts::decrypt(ke, &ZERO_IV, cipher)
         }
-    };
-
-    if plain.len() < enctype.confounder_len() {
-        return Err(Error::crypto(
-            "decrypted plaintext is shorter than the confounder",
-        ));
     }
-    Ok(plain[enctype.confounder_len()..].to_vec())
+}
+
+/// One integrity check, in constant time, over whatever this enctype covers.
+fn check_tag(
+    enctype: Enctype,
+    ki: &[u8],
+    covered: &[u8],
+    tag: &[u8],
+    mac_len: usize,
+) -> Result<()> {
+    let expect = hmac(enctype, ki, covered)?;
+    if !ct_eq(&expect[..mac_len], tag) {
+        return Err(Error::crypto("integrity check failed"));
+    }
+    Ok(())
 }
 
 /// The keyed checksum of RFC 3961 §5.4 / RFC 8009 §6: `HMAC` with `Kc`, truncated to `h` octets.

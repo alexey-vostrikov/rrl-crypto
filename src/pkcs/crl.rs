@@ -288,41 +288,74 @@ impl Crl {
     ///     onlyContainsAttributeCerts [5] BOOLEAN DEFAULT FALSE }
     /// ```
     fn read_idp(&mut self, value: &[u8]) -> Result<Idp> {
+        let flags = IdpFlags::read(value)?;
+        // OpenSSL's IDP_INVALID: more than one "only", or a CRL that is partial in a way this
+        // crate does not follow.
+        if flags.invalid() {
+            self.unusable = true;
+        }
+        Ok(flags.into_idp())
+    }
+
+    fn current(&self, now: i64) -> bool {
+        self.this_update <= now && self.next_update.is_none_or(|n| now <= n)
+    }
+}
+
+/// The flags of an `IssuingDistributionPoint`, read in the order the RFC lays them out.
+struct IdpFlags {
+    point: Option<Vec<u8>>,
+    only_user: bool,
+    only_ca: bool,
+    some_reasons: bool,
+    indirect: bool,
+    only_attribute: bool,
+}
+
+impl IdpFlags {
+    fn read(value: &[u8]) -> Result<IdpFlags> {
         let mut s = Reader::new(value).seq()?;
         let point = match s.rest().first() {
             Some(&t) if t == der::ctx(0) => Some(s.next_raw()?.2.to_vec()),
             _ => None,
         };
-        let flag = |n: u8, s: &mut Reader<'_>| -> Result<bool> {
-            Ok(match s.optional(implicit(n))? {
-                Some([0xFF]) => true,
-                Some(_) => return err("bad BOOLEAN in issuingDistributionPoint"),
-                None => false,
-            })
-        };
-        let only_user = flag(1, &mut s)?;
-        let only_ca = flag(2, &mut s)?;
-        let some_reasons = s.optional(implicit(3))?.is_some();
-        let indirect = flag(4, &mut s)?;
-        let only_attribute = flag(5, &mut s)?;
-        s.done("IssuingDistributionPoint")?;
-        // OpenSSL's IDP_INVALID: more than one "only".
-        if u8::from(only_user) + u8::from(only_ca) + u8::from(only_attribute) > 1
-            || some_reasons
-            || indirect
-        {
-            self.unusable = true;
-        }
-        Ok(Idp {
+        let flags = IdpFlags {
             point,
-            only_user,
-            only_ca,
-            only_attribute,
-        })
+            only_user: flag(&mut s, 1)?,
+            only_ca: flag(&mut s, 2)?,
+            some_reasons: s.optional(implicit(3))?.is_some(),
+            indirect: flag(&mut s, 4)?,
+            only_attribute: flag(&mut s, 5)?,
+        };
+        s.done("IssuingDistributionPoint")?;
+        Ok(flags)
     }
 
-    fn current(&self, now: i64) -> bool {
-        self.this_update <= now && self.next_update.is_none_or(|n| now <= n)
+    /// OpenSSL's `IDP_INVALID`: more than one "only", or a reason subset, or an indirect CRL. None
+    /// of the three can be judged by this crate, so the list carrying one is set aside rather than
+    /// read as if it said something narrower than it does.
+    fn invalid(&self) -> bool {
+        let onlies =
+            u8::from(self.only_user) + u8::from(self.only_ca) + u8::from(self.only_attribute);
+        onlies > 1 || self.some_reasons || self.indirect
+    }
+
+    fn into_idp(self) -> Idp {
+        Idp {
+            point: self.point,
+            only_user: self.only_user,
+            only_ca: self.only_ca,
+            only_attribute: self.only_attribute,
+        }
+    }
+}
+
+/// One `[n] BOOLEAN DEFAULT FALSE`, which DER writes as a single octet: `ff` or nothing.
+fn flag(s: &mut Reader<'_>, n: u8) -> Result<bool> {
+    match s.optional(implicit(n))? {
+        Some([0xFF]) => Ok(true),
+        Some(_) => err("bad BOOLEAN in issuingDistributionPoint"),
+        None => Ok(false),
     }
 }
 

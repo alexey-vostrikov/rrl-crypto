@@ -19,7 +19,7 @@
 
 use rskrb5::crypto::KerberosEtype;
 
-use super::{Cipher, Enctype, Key, KeyUse, Sha2Kind, ct_eq};
+use super::{Cipher, Enctype, Key, KeyUse, Sha2Kind};
 use crate::{Error, Result};
 
 /// `rskrb5`'s crypto behind this crate's [`Cipher`] trait.
@@ -169,15 +169,6 @@ impl Cipher for Rskrb5Cipher {
             }
         }
         .map_err(crypto_error)
-    }
-
-    fn verify_checksum(&self, key: &Key, usage: u32, data: &[u8], tag: &[u8]) -> Result<()> {
-        let expected = self.checksum(key, usage, data)?;
-        if ct_eq(&expected, tag) {
-            Ok(())
-        } else {
-            Err(Error::Crypto("checksum mismatch".into()))
-        }
     }
 }
 
