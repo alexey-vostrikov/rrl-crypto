@@ -56,6 +56,27 @@ pub const fn ctx(n: u8) -> u8 {
     0xa0 | n
 }
 
+/// A long-form length: `n` octets, minimal, and inside the data.
+///
+/// DER requires the long form only when the value does not fit the short one, so a long form
+/// carrying a value below `0x80` is refused: two encodings of one length are how a signature over
+/// one message verifies against another.
+fn long_length(context: &str, data: &[u8], p: usize, n: usize) -> Result<(usize, usize)> {
+    if n == 0 || n > 4 {
+        return err(context, format!("bad length form: {n} octets"));
+    }
+    if p + n > data.len() {
+        return err(context, "truncated: long length");
+    }
+    let v = data[p..p + n]
+        .iter()
+        .fold(0usize, |a, &b| (a << 8) | b as usize);
+    if v < 0x80 {
+        return err(context, "non-minimal length encoding");
+    }
+    Ok((v, p + n))
+}
+
 /// A DER decoding failure: what was expected, and where.
 ///
 /// A single string rather than a structured error: every caller either logs it or wraps it in its
@@ -233,41 +254,9 @@ impl<'a> Reader<'a> {
 
     /// The next TLV, with the name of the value in the error.
     pub fn next_tlv(&mut self, context: &str) -> Result<Tlv<'a>> {
-        let start = self.pos;
-        if start >= self.data.len() {
-            return err(context, "truncated: no tag");
-        }
-        let tag = self.data[start];
-        if tag & 0x1f == 0x1f {
-            return err(context, "high-tag-number form is not used by Kerberos");
-        }
-        let mut p = start + 1;
-        if p >= self.data.len() {
-            return err(context, "truncated: no length");
-        }
-        let first = self.data[p];
-        p += 1;
-        let len = if first & 0x80 == 0 {
-            first as usize
-        } else {
-            let n = (first & 0x7f) as usize;
-            if n == 0 || n > 4 {
-                return err(context, format!("bad length form: {n} octets"));
-            }
-            if p + n > self.data.len() {
-                return err(context, "truncated: long length");
-            }
-            let mut v = 0usize;
-            for &b in &self.data[p..p + n] {
-                v = (v << 8) | b as usize;
-            }
-            // DER: long form only when the value does not fit in the short form.
-            if v < 0x80 {
-                return err(context, "non-minimal length encoding");
-            }
-            p += n;
-            v
-        };
+        let (tag, mut p) = self.tag_at(context)?;
+        let (len, next) = self.length_at(context, p)?;
+        p = next;
         if p + len > self.data.len() {
             return err(
                 context,
@@ -279,6 +268,37 @@ impl<'a> Reader<'a> {
             tag,
             content: &self.data[p..p + len],
         })
+    }
+
+    /// The tag at the cursor, and where its length begins.
+    ///
+    /// The high-tag-number form extends the tag over more octets, and Kerberos uses no tag that
+    /// needs it: refusing here keeps every later offset in octets rather than in a form that
+    /// depends on the value.
+    fn tag_at(&self, context: &str) -> Result<(u8, usize)> {
+        let start = self.pos;
+        let Some(&tag) = self.data.get(start) else {
+            return err(context, "truncated: no tag");
+        };
+        if tag & 0x1f == 0x1f {
+            return err(context, "high-tag-number form is not used by Kerberos");
+        }
+        if start + 1 >= self.data.len() {
+            return err(context, "truncated: no length");
+        }
+        Ok((tag, start + 1))
+    }
+
+    /// The length at `p`, and where the content begins.
+    fn length_at(&self, context: &str, p: usize) -> Result<(usize, usize)> {
+        let Some(&first) = self.data.get(p) else {
+            return err(context, "truncated: no length");
+        };
+        let p = p + 1;
+        if first & 0x80 == 0 {
+            return Ok((first as usize, p));
+        }
+        long_length(context, self.data, p, (first & 0x7f) as usize)
     }
 
     /// The next TLV, which must carry `tag`.
@@ -627,38 +647,7 @@ pub fn seq_of<'a>(context: &str, content: &'a [u8], tag: u8) -> Result<Vec<&'a [
 /// The first octet carries two arcs packed as `40 * arc1 + arc2`, which is why the leading `2` of
 /// every OID in this file costs one octet and not two.
 pub fn decode_oid(context: &str, content: &[u8]) -> Result<String> {
-    let mut parts: Vec<u64> = Vec::new();
-    let mut value: u64 = 0;
-    let mut started = false;
-    for (i, &b) in content.iter().enumerate() {
-        if !started && b == 0x80 {
-            return err(context, "OID has a redundant leading 0x80");
-        }
-        started = true;
-        value = value
-            .checked_mul(128)
-            .and_then(|v| v.checked_add(u64::from(b & 0x7f)))
-            .ok_or_else(|| DerError(format!("{context}: OID arc overflows 64 bits")))?;
-        if b & 0x80 == 0 {
-            if parts.is_empty() {
-                let (first, second) = if value < 40 {
-                    (0, value)
-                } else if value < 80 {
-                    (1, value - 40)
-                } else {
-                    (2, value - 80)
-                };
-                parts.push(first);
-                parts.push(second);
-            } else {
-                parts.push(value);
-            }
-            value = 0;
-            started = false;
-        } else if i + 1 == content.len() {
-            return err(context, "OID ends in the middle of an arc");
-        }
-    }
+    let parts = oid_arcs(context, content)?;
     if parts.len() < 2 {
         return err(context, "OID has fewer than two arcs");
     }
@@ -667,6 +656,56 @@ pub fn decode_oid(context: &str, content: &[u8]) -> Result<String> {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join("."))
+}
+
+/// The arcs of an OID: base-128, high bit continuing, the first octet carrying two of them.
+fn oid_arcs(context: &str, content: &[u8]) -> Result<Vec<u64>> {
+    let mut arcs: Vec<u64> = Vec::new();
+    let mut acc: u64 = 0;
+    // Whether the arc being read has no octets yet, which is what makes a leading `0x80` redundant
+    // rather than a value.
+    let mut fresh = true;
+    for (i, &b) in content.iter().enumerate() {
+        if fresh && b == 0x80 {
+            return err(context, "OID has a redundant leading 0x80");
+        }
+        fresh = false;
+        acc = acc
+            .checked_mul(128)
+            .and_then(|v| v.checked_add(u64::from(b & 0x7f)))
+            .ok_or_else(|| DerError(format!("{context}: OID arc overflows 64 bits")))?;
+        if b & 0x80 != 0 {
+            // A continuation octet at the end means the arc never finished.
+            if i + 1 == content.len() {
+                return err(context, "OID ends in the middle of an arc");
+            }
+            continue;
+        }
+        push_arc(&mut arcs, acc);
+        acc = 0;
+        fresh = true;
+    }
+    Ok(arcs)
+}
+
+/// One complete arc, expanding the first into the two that share it.
+fn push_arc(arcs: &mut Vec<u64>, value: u64) {
+    if !arcs.is_empty() {
+        arcs.push(value);
+        return;
+    }
+    let (first, second) = first_arcs(value);
+    arcs.push(first);
+    arcs.push(second);
+}
+
+/// `X.Y` from the first value, per X.690 §8.19.4: `0`, `1` and `2` own ranges of it.
+fn first_arcs(value: u64) -> (u64, u64) {
+    match value {
+        0..=39 => (0, value),
+        40..=79 => (1, value - 40),
+        _ => (2, value - 80),
+    }
 }
 
 /// `UTCTime`: `YYMMDDHHMM[SS](Z|±hhmm)`, with the year window of RFC 5280 §4.1.2.5.1.
@@ -1180,5 +1219,22 @@ mod tests {
     /// A `[n]` field holding `content`.
     fn field_bytes(n: u8, content: &[u8]) -> Vec<u8> {
         tlv(ctx(n), content)
+    }
+
+    /// A `UTCTime` too short to hold `YYMMDDHHMM` and a zone.
+    ///
+    /// Ten digits is the floor, and the zone makes eleven. A shorter string is refused by name
+    /// rather than sliced, which is what a caller reading the message needs to know: the octets are
+    /// not a time at all.
+    #[test]
+    fn a_utc_time_too_short_to_hold_a_zone_is_refused() {
+        let e = as_utc_time("T", b"2401010000").unwrap_err();
+        assert!(e.0.contains("too short"), "{e}");
+        // And exactly at the floor, with a zone, it reads.
+        assert_eq!(
+            as_utc_time("T", b"2401010000Z").unwrap(),
+            1_704_067_200,
+            "2024-01-01T00:00:00Z"
+        );
     }
 }

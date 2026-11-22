@@ -128,44 +128,64 @@ pub fn encrypt_parts_with_confounder(
 ) -> Result<Vec<u8>> {
     check_ke(enctype, ke)?;
     check_ki(enctype, ki)?;
-    if confounder.len() != enctype.confounder_len() {
-        return Err(Error::crypto(format!(
-            "confounder is {} octets, {} needs {}",
-            confounder.len(),
-            enctype.name(),
-            enctype.confounder_len()
-        )));
-    }
+    check_confounder(enctype, confounder)?;
+    let plain = joined(enctype, confounder, parts);
+    seal(enctype, ke, ki, &plain)
+}
 
-    let mut out = Vec::with_capacity(
-        confounder.len() + parts.iter().map(|p| p.len()).sum::<usize>() + enctype.mac_len(),
-    );
+/// The confounder has to be exactly the length the enctype reserves for it.
+fn check_confounder(enctype: Enctype, confounder: &[u8]) -> Result<()> {
+    if confounder.len() == enctype.confounder_len() {
+        return Ok(());
+    }
+    Err(Error::crypto(format!(
+        "confounder is {} octets, {} needs {}",
+        confounder.len(),
+        enctype.name(),
+        enctype.confounder_len()
+    )))
+}
+
+/// The plaintext to protect: the confounder, then the parts in the order given.
+fn joined(enctype: Enctype, confounder: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let len = confounder.len() + parts.iter().map(|p| p.len()).sum::<usize>() + enctype.mac_len();
+    let mut out = Vec::with_capacity(len);
     out.extend_from_slice(confounder);
     for part in parts {
         out.extend_from_slice(part);
     }
+    out
+}
 
+/// The sealed message: what this enctype's RFC says the MAC covers, and where the tag goes.
+fn seal(enctype: Enctype, ke: &[u8], ki: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     match enctype.sha2_kind() {
         // RFC 3962 §5.3: the MAC covers the plaintext, confounder included, and follows the
         // ciphertext.
         None => {
-            let tag = hmac(enctype, ki, &out)?;
-            let mut sealed = aes_cts::encrypt(ke, &ZERO_IV, &out)?;
-            sealed.extend_from_slice(&tag[..enctype.mac_len()]);
-            Ok(sealed)
+            let tag = hmac(enctype, ki, plain)?;
+            Ok(tagged(
+                aes_cts::encrypt(ke, &ZERO_IV, plain)?,
+                &tag,
+                enctype,
+            ))
         }
         // RFC 8009 §5: the MAC covers `IV | C`, so the receiver can check it before decrypting.
         Some(_) => {
-            let cipher = aes_cts::encrypt(ke, &ZERO_IV, &out)?;
+            let cipher = aes_cts::encrypt(ke, &ZERO_IV, plain)?;
             let mut macced = Vec::with_capacity(BLOCK + cipher.len());
             macced.extend_from_slice(&ZERO_IV);
             macced.extend_from_slice(&cipher);
             let tag = hmac(enctype, ki, &macced)?;
-            let mut sealed = cipher;
-            sealed.extend_from_slice(&tag[..enctype.mac_len()]);
-            Ok(sealed)
+            Ok(tagged(cipher, &tag, enctype))
         }
     }
+}
+
+/// The sealed message: the ciphertext with its MAC truncated to this enctype's length.
+fn tagged(mut cipher: Vec<u8>, tag: &[u8], enctype: Enctype) -> Vec<u8> {
+    cipher.extend_from_slice(&tag[..enctype.mac_len()]);
+    cipher
 }
 
 /// [`decrypt`], returning the plaintext without the confounder.

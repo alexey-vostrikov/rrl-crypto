@@ -141,6 +141,16 @@ fn optional_time(t: &mut Reader<'_>) -> Result<Option<i64>> {
     }
 }
 
+/// The two fields every entry has: the serial it revokes, and the date it was revoked.
+///
+/// Read together because they are the entry's whole content in the common case — the extensions
+/// that follow are optional and only a delta CRL or an indirect CRL has anything to say there.
+fn serial_and_date(e: &mut Reader<'_>) -> Result<Vec<u8>> {
+    let serial = e.expect(der::INTEGER)?.to_vec();
+    x509::read_time(e)?;
+    Ok(serial)
+}
+
 /// One `revokedCertificate`.
 struct Entry {
     serial: Vec<u8>,
@@ -185,10 +195,8 @@ fn revoked_entries(t: &mut Reader<'_>, version: i64) -> Result<Vec<Entry>> {
 /// One entry: its serial, its date, and the extensions that may say it is back.
 fn entry(entries: &mut Reader<'_>, version: i64) -> Result<Entry> {
     let mut e = entries.seq()?;
-    let serial = e.expect(der::INTEGER)?.to_vec();
-    x509::read_time(&mut e)?;
     let mut out = Entry {
-        serial,
+        serial: serial_and_date(&mut e)?,
         removed: false,
         unhandled_critical: false,
     };
@@ -312,15 +320,20 @@ struct IdpFlags {
     only_attribute: bool,
 }
 
+/// The `distributionPoint` field of an `IssuingDistributionPoint`, whole TLV, when the list
+/// restricts itself to one point.
+fn idp_point(s: &mut Reader<'_>) -> Result<Option<Vec<u8>>> {
+    match s.rest().first() {
+        Some(&t) if t == der::ctx(0) => Ok(Some(s.next_raw()?.2.to_vec())),
+        _ => Ok(None),
+    }
+}
+
 impl IdpFlags {
     fn read(value: &[u8]) -> Result<IdpFlags> {
         let mut s = Reader::new(value).seq()?;
-        let point = match s.rest().first() {
-            Some(&t) if t == der::ctx(0) => Some(s.next_raw()?.2.to_vec()),
-            _ => None,
-        };
         let flags = IdpFlags {
-            point,
+            point: idp_point(&mut s)?,
             only_user: flag(&mut s, 1)?,
             only_ca: flag(&mut s, 2)?,
             some_reasons: s.optional(implicit(3))?.is_some(),
@@ -534,37 +547,76 @@ fn check_selected(
 /// covers `cert`.
 fn in_scope(cert: &Cert, crl: &Crl) -> bool {
     let Some(idp) = &crl.idp else {
+        // No issuingDistributionPoint: the CRL covers everything its issuer signed.
         return true;
     };
-    if idp.only_attribute || (cert.is_ca() && idp.only_user) || (!cert.is_ca() && idp.only_ca) {
+    if wrong_kind(cert, idp) {
         return false;
     }
     let Some(point) = &idp.point else {
         return true;
     };
-    // The certificate's cRLDistributionPoints: one without a cRLIssuer
-    // whose name is absent or shares a GeneralName with the CRL's.
     let Some(e) = cert.extension(CRL_DISTRIBUTION_POINTS) else {
         return false;
     };
-    let Ok(mut dps) = Reader::new(&e.value).seq() else {
-        return false;
+    points_of(&e.value).iter().any(|dp| dp.covers(point))
+}
+
+/// Whether the CRL is restricted to a kind of certificate `cert` is not.
+///
+/// `onlyContainsAttributeCerts` excludes everything this crate validates: an attribute certificate
+/// is not a certificate here, so a CRL restricted to them covers nothing it holds.
+fn wrong_kind(cert: &Cert, idp: &Idp) -> bool {
+    idp.only_attribute || (cert.is_ca() && idp.only_user) || (!cert.is_ca() && idp.only_ca)
+}
+
+/// One `DistributionPoint` of the certificate's `cRLDistributionPoints`.
+struct Point<'a> {
+    /// The `distributionPoint` name, whole `[0]` TLV, when the entry has one.
+    name: Option<&'a [u8]>,
+    /// The entry names a `cRLIssuer`, which makes it a pointer to an indirect CRL.
+    indirect: bool,
+}
+
+impl Point<'_> {
+    /// Whether this entry is the one the CRL's `distributionPoint` names.
+    ///
+    /// An entry that names a `cRLIssuer` is skipped: it points at a CRL somebody else issues, and
+    /// this call is about the issuer's own.
+    fn covers(&self, point: &[u8]) -> bool {
+        !self.indirect && self.name.is_none_or(|n| same_point(n, point))
+    }
+}
+
+/// Every `DistributionPoint` of the extension's value, in the order written.
+///
+/// A value that does not parse yields no points, which `in_scope` reads as "the certificate does
+/// not point at this CRL" — the same answer as an absent extension, and the safe one.
+fn points_of(value: &[u8]) -> Vec<Point<'_>> {
+    let Ok(mut dps) = Reader::new(value).seq() else {
+        return Vec::new();
     };
+    let mut points = Vec::new();
     while let Ok(mut dp) = dps.seq() {
-        let mut name = None;
-        let mut has_crl_issuer = false;
-        while let Ok((tag, _, raw)) = dp.next_raw() {
-            if tag == der::ctx(0) {
-                name = Some(raw);
-            } else if tag == der::ctx(2) {
-                has_crl_issuer = true;
-            }
-        }
-        if !has_crl_issuer && name.is_none_or(|n| same_point(n, point)) {
-            return true;
+        points.push(point_of(&mut dp));
+    }
+    points
+}
+
+/// The two fields of a `DistributionPoint` this crate reads.
+fn point_of<'a>(dp: &mut Reader<'a>) -> Point<'a> {
+    let mut point = Point {
+        name: None,
+        indirect: false,
+    };
+    while let Ok((tag, _, raw)) = dp.next_raw() {
+        if tag == der::ctx(0) {
+            point.name = Some(raw);
+        } else if tag == der::ctx(2) {
+            point.indirect = true;
         }
     }
-    false
+    point
 }
 
 /// Whether two DistributionPointNames (whole `[0]` TLVs) name the same

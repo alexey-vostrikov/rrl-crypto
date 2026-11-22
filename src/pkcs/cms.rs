@@ -199,16 +199,31 @@ fn content_field(ed: &mut Reader<'_>, cek: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
     let mut eci = ed.seq()?;
     let content_type = eci.oid()?.to_vec();
     let (alg, params) = eci.alg_id()?;
+    let iv = iv_of(params)?;
+    let ciphertext = ciphertext_of(&mut eci)?;
+    Ok((content_type, decrypt_content(alg, cek, &iv, ciphertext)?))
+}
+
+/// The IV, which these ciphers carry in the algorithm's parameters.
+///
+/// Its absence is a refusal rather than a zero IV: a zero IV under a fixed key encrypts the same
+/// plaintext to the same ciphertext, and nothing in CMS says the sender chose to do that.
+fn iv_of(params: Option<&[u8]>) -> Result<Vec<u8>> {
     let params =
         params.ok_or_else(|| DerError("the reply key's content encryption has no IV".into()))?;
-    let iv = Reader::new(params).octets()?.to_vec();
-    // Primitive as DER writes it; BER may construct it, and a KDC in the wild has been seen to.
-    let (tag, ciphertext) = eci.next()?;
+    Ok(Reader::new(params).octets()?.to_vec())
+}
+
+/// The ciphertext, which BER may write constructed and DER primitive.
+///
+/// A KDC in the wild has been seen to construct it, so both tags are accepted and the content is
+/// the same octets either way.
+fn ciphertext_of<'a>(eci: &mut Reader<'a>) -> Result<&'a [u8]> {
+    let (tag, content) = eci.next()?;
     if tag != asn1::implicit(0) && tag != der::ctx(0) {
         return err("the reply key's content encryption carries no ciphertext");
     }
-    let plaintext = decrypt_content(alg, cek, &iv, ciphertext)?;
-    Ok((content_type, plaintext))
+    Ok(content)
 }
 
 /// AES-CBC, in the two key sizes the RFC names for CMS.
@@ -651,24 +666,14 @@ struct SignerFields<'a> {
 }
 
 /// The `SignerInfo` fields that do not depend on the content it signs.
+///
+/// Read in the order the structure gives them — identifier, digest algorithm, signed attributes,
+/// signature algorithm, signature — so each helper takes the reader where the previous one left it.
 fn signer_parts<'a>(si: &mut Reader<'a>, certs: &[Cert]) -> Result<SignerFields<'a>> {
-    // `SignerIdentifier ::= CHOICE { issuerAndSerialNumber SEQUENCE, subjectKeyIdentifier [0] }`.
-    // Heimdal signs with the key identifier and MIT with the issuer and serial — both are legal,
-    // and a verifier that knows only one of them interops with only one of them.
-    let (sid_tag, sid) = si.next()?;
-    let index = signer_of(certs, sid_tag, sid)?;
-    trace("sid");
-    let (digest_oid, _) = si.alg_id()?;
-    let hash = Hash::from_oid(digest_oid)
-        .ok_or_else(|| DerError("unsupported SignedData digest algorithm".into()))?;
-    let attrs = si
-        .optional(der::ctx(0))?
-        .ok_or_else(|| DerError("SignedData without signed attributes".into()))?;
-    let (sig_oid, _) = si.alg_id()?;
-    let alg = signature_alg(sig_oid, hash)?;
-    let signature = si.octets()?.to_vec();
-    si.optional(der::ctx(1))?; // unsignedAttrs
-    si.done("SignerInfo")?;
+    let index = signer_certificate(si, certs)?;
+    let hash = digest_algorithm(si)?;
+    let attrs = signed_attrs(si)?;
+    let (alg, signature) = signature_and_value(si, hash)?;
     Ok(SignerFields {
         index,
         hash,
@@ -676,6 +681,44 @@ fn signer_parts<'a>(si: &mut Reader<'a>, certs: &[Cert]) -> Result<SignerFields<
         alg,
         signature,
     })
+}
+
+/// Which certificate in the set signed this `SignerInfo`.
+///
+/// `SignerIdentifier ::= CHOICE { issuerAndSerialNumber SEQUENCE, subjectKeyIdentifier [0] }`:
+/// Heimdal signs with the key identifier and MIT with the issuer and serial — both are legal, and a
+/// verifier that knows only one of them interops with only one of them.
+fn signer_certificate(si: &mut Reader<'_>, certs: &[Cert]) -> Result<usize> {
+    let (sid_tag, sid) = si.next()?;
+    let index = signer_of(certs, sid_tag, sid)?;
+    trace("sid");
+    Ok(index)
+}
+
+/// The digest algorithm the signer says it used.
+///
+/// The one at the top of `SignedData` is not consulted: every `SignerInfo` names its own, and a
+/// verifier that trusted the outer set would accept a signature whose digest was never listed.
+fn digest_algorithm(si: &mut Reader<'_>) -> Result<Hash> {
+    let (oid, _) = si.alg_id()?;
+    Hash::from_oid(oid).ok_or_else(|| DerError("unsupported SignedData digest algorithm".into()))
+}
+
+/// The signed attributes, which a `SignerInfo` must carry: the signature covers them, and through
+/// them the content.
+fn signed_attrs<'a>(si: &mut Reader<'a>) -> Result<&'a [u8]> {
+    si.optional(der::ctx(0))?
+        .ok_or_else(|| DerError("SignedData without signed attributes".into()))
+}
+
+/// The signature algorithm, the signature, and the end of the `SignerInfo`.
+fn signature_and_value(si: &mut Reader<'_>, hash: Hash) -> Result<(SigAlg, Vec<u8>)> {
+    let (oid, _) = si.alg_id()?;
+    let alg = signature_alg(oid, hash)?;
+    let signature = si.octets()?.to_vec();
+    si.optional(der::ctx(1))?; // unsignedAttrs
+    si.done("SignerInfo")?;
+    Ok((alg, signature))
 }
 
 /// Which certificate in the set is the signer, by either identifier the RFC allows.

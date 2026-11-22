@@ -156,6 +156,26 @@ pub enum PrivateKey {
     Ec(ec::PrivateKey),
 }
 
+/// The key a `PrivateKeyInfo` names, by the algorithm in its header.
+///
+/// An RSA key is handed the whole `der` rather than its inner octets: `rsa::PrivateKey::from_der`
+/// reads either shape, and passing the wrapper is what makes the two entry points one parser.
+fn key_of(alg: &[u8], params: Option<&[u8]>, s: &mut Reader<'_>, der: &[u8]) -> Result<PrivateKey> {
+    if alg == asn1::oid(rsa::RSA_ENCRYPTION) {
+        return Ok(PrivateKey::Rsa(rsa::PrivateKey::from_der(der)?));
+    }
+    if alg == asn1::oid(ec::ID_EC_PUBLIC_KEY) {
+        let curve = ec::Curve::from_params(params)?;
+        return Ok(PrivateKey::Ec(ec::PrivateKey::from_sec1(
+            s.octets()?,
+            Some(curve),
+        )?));
+    }
+    Err(DerError(
+        "unsupported private key algorithm (only RSA and EC)".into(),
+    ))
+}
+
 impl PrivateKey {
     /// The key as an RSA key, when it is one: RSA key transport needs a modulus to be encrypted
     /// to, and an EC key cannot receive it.
@@ -191,21 +211,9 @@ impl PrivateKey {
         let mut r = Reader::new(der);
         let mut s = r.seq()?;
         r.done("PrivateKeyInfo")?;
-        s.int()?;
+        s.int()?; // version
         let (alg, params) = s.alg_id()?;
-        if alg == asn1::oid(rsa::RSA_ENCRYPTION) {
-            Ok(PrivateKey::Rsa(rsa::PrivateKey::from_der(der)?))
-        } else if alg == asn1::oid(ec::ID_EC_PUBLIC_KEY) {
-            let curve = ec::Curve::from_params(params)?;
-            Ok(PrivateKey::Ec(ec::PrivateKey::from_sec1(
-                s.octets()?,
-                Some(curve),
-            )?))
-        } else {
-            Err(DerError(
-                "unsupported private key algorithm (only RSA and EC)".into(),
-            ))
-        }
+        key_of(alg, params, &mut s, der)
     }
 
     pub fn public(&self) -> PublicKey {
@@ -269,5 +277,47 @@ mod tests {
         // RFC 5758: no parameters for ECDSA; RFC 4055: NULL for RSA.
         assert!(!SigAlg::Ecdsa(Hash::Sha256).alg_id().ends_with(&[5, 0]));
         assert!(SigAlg::Rsa(Hash::Sha256).alg_id().ends_with(&[5, 0]));
+    }
+
+    /// Every label a PEM file may put a key under, and what happens to the ones that carry none.
+    ///
+    /// `from_pem_blocks` walks the blocks in order and takes the first that holds an unencrypted
+    /// key: a file holding a certificate and a key is the normal shape of what `openssl pkcs12`
+    /// writes, so skipping a block is the common path rather than an edge case — and it was the one
+    /// no test entered.
+    #[test]
+    fn every_label_a_pem_file_uses_is_read_and_others_are_skipped() {
+        // PKCS #8, which is what `openssl genrsa` writes today: "PRIVATE KEY".
+        let pkcs8 = pem::blocks(include_bytes!("testdata/kdc-key.pem")).unwrap();
+        assert_eq!(pkcs8[0].0, "PRIVATE KEY");
+        assert!(matches!(
+            PrivateKey::from_pem_blocks(&pkcs8).unwrap(),
+            PrivateKey::Rsa(_)
+        ));
+
+        // SEC 1 EC key, "EC PRIVATE KEY", whose curve is inside rather than beside it.
+        let sec1 = pem::blocks(include_bytes!("testdata/ec-kdc-key.pem")).unwrap();
+        assert_eq!(sec1[0].0, "EC PRIVATE KEY");
+        assert!(matches!(
+            PrivateKey::from_pem_blocks(&sec1).unwrap(),
+            PrivateKey::Ec(_)
+        ));
+
+        // A certificate first, then the key: the certificate is skipped, not refused.
+        let mut mixed = vec![("CERTIFICATE".to_string(), vec![0x30, 0x00])];
+        mixed.extend(pkcs8.clone());
+        assert!(matches!(
+            PrivateKey::from_pem_blocks(&mixed).unwrap(),
+            PrivateKey::Rsa(_)
+        ));
+
+        // Nothing that holds a key.
+        let none = vec![("CERTIFICATE".to_string(), vec![0x30, 0x00])];
+        let e = PrivateKey::from_pem_blocks(&none).unwrap_err();
+        assert!(e.0.contains("no unencrypted RSA or EC private key"), "{e}");
+        assert!(
+            PrivateKey::from_pem_blocks(&[]).is_err(),
+            "an empty file holds none"
+        );
     }
 }

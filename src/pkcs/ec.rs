@@ -375,4 +375,15 @@ mod tests {
             "secp256k1"
         );
     }
+
+    /// A SEC 1 key whose version is not 1.
+    ///
+    /// The version is the first thing in the structure and the only field that says what follows
+    /// it; a key that claims another version is one this parser would read on a guess.
+    #[test]
+    fn an_ec_key_of_another_version_is_refused() {
+        let der = der::seq(&[der::int(2), der::octets(&[1u8; 32])]);
+        let e = PrivateKey::from_sec1(&der, Some(Curve::P256)).unwrap_err();
+        assert!(e.0.contains("unsupported ECPrivateKey version"), "{e}");
+    }
 }

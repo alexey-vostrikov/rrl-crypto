@@ -17,7 +17,6 @@
 //! `crypto_tests` (in `tests/vectors_mit.rs`) and Heimdal's
 //! `derived-key-test.c` / `aes-test.c` (below).
 
-use aes::cipher::BlockCipherEncrypt;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha384};
@@ -187,6 +186,16 @@ pub fn cf2(
 /// the *previous ciphertext* with the all-zero initial state (ECB), not a
 /// chained IV. AES-128 needs one block, AES-256 two.
 pub fn dr(base_key: &[u8], constant: &[u8], k: usize) -> Result<Vec<u8>> {
+    check_dr_args(base_key, constant, k)?;
+    let block = dr_block(constant)?;
+    Ok(dr_expand(base_key, block, k))
+}
+
+/// The three refusals a caller can earn before any AES is done.
+///
+/// They are one statement — "these arguments describe no derivation RFC 3961 defines" — and each
+/// names the argument at fault, because a caller reading the message is the one who can fix it.
+fn check_dr_args(base_key: &[u8], constant: &[u8], k: usize) -> Result<()> {
     if base_key.len() != 16 && base_key.len() != 32 {
         return Err(Error::Crypto(format!(
             "DR/DK needs a 16- or 32-octet AES key, got {}",
@@ -199,40 +208,54 @@ pub fn dr(base_key: &[u8], constant: &[u8], k: usize) -> Result<Vec<u8>> {
     if k == 0 || k > 32 {
         return Err(Error::Crypto(format!("DR output length {k} out of range")));
     }
+    Ok(())
+}
 
+/// The constant folded to one AES block.
+///
+/// A constant longer than the block is refused rather than truncated: RFC 3961 §5.1 caps it, and
+/// truncating would make two different constants derive the same key.
+fn dr_block(constant: &[u8]) -> Result<[u8; AES_BLOCK]> {
     let mut block = [0u8; AES_BLOCK];
-    if constant.len() == AES_BLOCK {
-        block.copy_from_slice(constant);
-    } else if constant.len() > AES_BLOCK {
-        return Err(Error::Crypto(format!(
-            "DR constant is {} octets; RFC 3961 §5.1 caps it at the block size",
-            constant.len()
-        )));
-    } else {
-        block.copy_from_slice(&n_fold(constant, AES_BLOCK * 8));
+    match constant.len() {
+        AES_BLOCK => block.copy_from_slice(constant),
+        n if n > AES_BLOCK => {
+            return Err(Error::Crypto(format!(
+                "DR constant is {n} octets; RFC 3961 §5.1 caps it at the block size"
+            )));
+        }
+        _ => block.copy_from_slice(&n_fold(constant, AES_BLOCK * 8)),
     }
+    Ok(block)
+}
 
+/// The key, expanded a block at a time: `K1 = E(K, K1)`, `K2 = E(K, K1)`, and so on.
+fn dr_expand(base_key: &[u8], mut block: [u8; AES_BLOCK], k: usize) -> Vec<u8> {
     use aes::cipher::KeyInit;
     let mut out = Vec::with_capacity(k + AES_BLOCK);
     if base_key.len() == 16 {
-        let c =
-            aes::Aes128::new_from_slice(base_key).map_err(|_| Error::Crypto("AES-128".into()))?;
-        while out.len() < k {
-            let ga = (&mut block).into();
-            c.encrypt_block(ga);
-            out.extend_from_slice(&block);
-        }
+        let c = aes::Aes128::new_from_slice(base_key).expect("a 16-octet key");
+        encrypt_into(&c, &mut block, &mut out, k);
     } else {
-        let c =
-            aes::Aes256::new_from_slice(base_key).map_err(|_| Error::Crypto("AES-256".into()))?;
-        while out.len() < k {
-            let ga = (&mut block).into();
-            c.encrypt_block(ga);
-            out.extend_from_slice(&block);
-        }
+        let c = aes::Aes256::new_from_slice(base_key).expect("a 32-octet key");
+        encrypt_into(&c, &mut block, &mut out, k);
     }
     out.truncate(k);
-    Ok(out)
+    out
+}
+
+/// Encrypts `block` in place until `out` holds at least `k` octets.
+fn encrypt_into<C>(cipher: &C, block: &mut [u8; AES_BLOCK], out: &mut Vec<u8>, k: usize)
+where
+    C: aes::cipher::BlockSizeUser<BlockSize = aes::cipher::consts::U16>
+        + aes::cipher::BlockCipherEncrypt,
+{
+    while out.len() < k {
+        let mut b = aes::cipher::Block::<C>::try_from(&block[..]).expect("a sixteen-octet block");
+        cipher.encrypt_block(&mut b);
+        block.copy_from_slice(&b);
+        out.extend_from_slice(block);
+    }
 }
 
 /// RFC 3961 §5.1 `DK = random-to-key(DR(...))`. For every AES enctype

@@ -44,6 +44,39 @@ pub struct PublicKey {
     e: Vec<u8>,
 }
 
+/// The modulus has to be the size this implementation works in, and odd.
+///
+/// Even is not a workable modulus at all: an even `n` has 2 as a factor, and every exponentiation
+/// modulo it loses information. The length check is a policy decision — it keeps the arithmetic
+/// inside the size the tests cover — and it says so rather than leaving a reader to guess.
+fn check_modulus(n: &[u8]) -> Result<(), DerError> {
+    let bits = n.len() * 8;
+    if !(MIN_BITS..=MAX_BITS).contains(&bits) {
+        return Err(DerError(format!(
+            "unsupported RSA modulus of {} octets",
+            n.len()
+        )));
+    }
+    if n[n.len() - 1] & 1 == 0 {
+        return Err(DerError("an RSA modulus cannot be even".into()));
+    }
+    Ok(())
+}
+
+/// The public exponent has to be odd, more than one, and small enough to exponentiate with.
+///
+/// `e = 1` is refused by name because it is the one wrong exponent that produces a signature check
+/// which passes for every input: `m^1 mod n = m`, so any `sig == emsa(..)` verifies.
+fn check_exponent(e: &[u8]) -> Result<(), DerError> {
+    if e.is_empty() || e.len() > 8 {
+        return Err(DerError("unsupported RSA public exponent".into()));
+    }
+    if e == [1] || e[e.len() - 1] & 1 == 0 {
+        return Err(DerError("unsupported RSA public exponent".into()));
+    }
+    Ok(())
+}
+
 impl PublicKey {
     /// `RSAPublicKey ::= SEQUENCE { modulus, publicExponent }`, the
     /// content of an `rsaEncryption` SubjectPublicKeyInfo's BIT STRING.
@@ -54,15 +87,8 @@ impl PublicKey {
         let e = s.uint()?.to_vec();
         s.done("RSAPublicKey")?;
         r.done("RSAPublicKey")?;
-        if !(MIN_BITS..=MAX_BITS).contains(&(n.len() * 8)) || n[n.len() - 1] & 1 == 0 {
-            return Err(DerError(format!(
-                "unsupported RSA modulus of {} octets",
-                n.len()
-            )));
-        }
-        if e.is_empty() || e.len() > 8 || e[e.len() - 1] & 1 == 0 || e == [1] {
-            return Err(DerError("unsupported RSA public exponent".into()));
-        }
+        check_modulus(&n)?;
+        check_exponent(&e)?;
         Ok(PublicKey { n, e })
     }
 
@@ -152,6 +178,38 @@ fn pkcs1_inner(s: &mut Reader<'_>) -> Result<PrivateKey, DerError> {
     Ok(PrivateKey { public, d: padded })
 }
 
+/// The ciphertext as the k-octet integer it has to be.
+///
+/// A value wider than the modulus is not a block this key can have made: `modpow` would silently
+/// work modulo n and produce a plaintext the padding check then rejects, with a message about
+/// padding where the truth is about the ciphertext's size.
+fn left_pad(ciphertext: &[u8], k: usize) -> Result<Vec<u8>, DerError> {
+    if ciphertext.is_empty() || ciphertext.len() > k {
+        return Err(DerError(
+            "the encrypted key is not the modulus' length".into(),
+        ));
+    }
+    let mut c = vec![0; k - ciphertext.len()];
+    c.extend_from_slice(ciphertext);
+    Ok(c)
+}
+
+/// The message inside a PKCS #1 v1.5 block: `00 02 PS 00 M`, with `PS` at least eight octets.
+fn unpkcs1(em: &[u8]) -> Result<Vec<u8>, DerError> {
+    let bad = || DerError("the encrypted key is not a PKCS #1 v1.5 block".into());
+    if em.len() < 2 || em[0] != 0x00 || em[1] != 0x02 {
+        return Err(bad());
+    }
+    let rest = &em[2..];
+    let sep = rest.iter().position(|&b| b == 0).ok_or_else(bad)?;
+    // RFC 8017 §7.2.2: the padding string is at least eight octets, which is what makes a
+    // block guessable only to someone who could already compute the key.
+    if sep < 8 {
+        return Err(bad());
+    }
+    Ok(rest[sep + 1..].to_vec())
+}
+
 impl PrivateKey {
     /// PKCS #1 `RSAPrivateKey` (PEM `RSA PRIVATE KEY`) or a PKCS #8
     /// `PrivateKeyInfo` holding one (PEM `PRIVATE KEY`, what `openssl req
@@ -199,13 +257,7 @@ impl PrivateKey {
     /// than unwrapped — a signature fed in as an encrypted key must not produce a plaintext.
     pub fn decrypt_pkcs1_v15(&self, ciphertext: &[u8]) -> Result<Vec<u8>, DerError> {
         let k = self.public.n.len();
-        if ciphertext.len() > k || ciphertext.is_empty() {
-            return Err(DerError(
-                "the encrypted key is not the modulus' length".into(),
-            ));
-        }
-        let mut c = vec![0; k - ciphertext.len()];
-        c.extend_from_slice(ciphertext);
+        let c = left_pad(ciphertext, k)?;
         if !less(&c, &self.public.n) {
             return Err(DerError(
                 "the encrypted key is not below the modulus".into(),
@@ -216,16 +268,7 @@ impl PrivateKey {
         // `modpow` may drop leading zero octets; the block is exactly k long.
         let mut em = vec![0; k - m.len().min(k)];
         em.extend_from_slice(&m[m.len().saturating_sub(k)..]);
-        let bad = || DerError("the encrypted key is not a PKCS #1 v1.5 block".into());
-        if em.len() != k || em[0] != 0x00 || em[1] != 0x02 {
-            return Err(bad());
-        }
-        let rest = &em[2..];
-        let sep = rest.iter().position(|&b| b == 0).ok_or_else(bad)?;
-        if sep < 8 {
-            return Err(bad());
-        }
-        Ok(rest[sep + 1..].to_vec())
+        unpkcs1(&em)
     }
 }
 

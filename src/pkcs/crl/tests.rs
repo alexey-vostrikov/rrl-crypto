@@ -585,3 +585,25 @@ fn an_openssl_crl_revokes_the_fixture_intermediate() {
     let fake_path = [&kdc, &pool[0], &other[0]];
     check_chain(&fake_path, policy, &[], NOW).unwrap();
 }
+
+/// An entry carrying extensions in a CRL that declares no version.
+///
+/// The version field is what says the issuer meant v2, and entry extensions exist only there. A
+/// list with extensions and no version is one whose producer wrote a structure it did not mean, so
+/// the entry is refused rather than read as if the extensions were decoration.
+#[test]
+fn entry_extensions_before_v2_are_refused() {
+    let key = mid_key();
+    let tbs = der::seq(&[
+        key.sig_alg().alg_id(), // no version at all: this is a v1 list
+        name("CN=mid"),
+        der::time(NOW - DAY),
+        der::seq(&[der::seq(&[
+            der::int(7),
+            der::time(NOW),
+            der::seq(&[ext("2.5.29.21", true, der::tlv(0x0A, &[1]))]),
+        ])]),
+    ]);
+    let e = Crl::from_der(&sign(&key, tbs)).unwrap_err();
+    assert!(e.0.contains("entry extensions in a CRL before v2"), "{e}");
+}

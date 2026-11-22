@@ -425,26 +425,46 @@ fn legacy(oid: &[u8], p: &mut Reader<'_>, password: Option<&str>, data: &[u8]) -
 /// `PBKDF2-params ::= SEQUENCE { salt OCTET STRING, iterationCount,
 /// keyLength OPTIONAL, prf DEFAULT hmacWithSHA1 }`.
 fn pbkdf2_key(params: Option<&[u8]>, password: &[u8], len: usize) -> Result<Vec<u8>> {
-    let mut p = Reader::new(params.unwrap_or(&[])).seq()?;
-    let salt = p.octets()?;
-    let rounds = iterations(&mut p)?;
-    let mut len = len;
-    if p.rest().first() == Some(&der::INTEGER) {
-        len = usize::try_from(p.int()?).map_err(|_| Error::Malformed("bad keyLength".into()))?;
-    }
-    let prf = if p.is_empty() {
-        Digest12::Sha1
-    } else {
-        let (oid, _) = p.alg_id()?;
-        Digest12::from_hmac_oid(oid)
-            .ok_or_else(|| Error::Malformed("unsupported PBKDF2 PRF".into()))?
-    };
+    let (salt, rounds, len, prf) = pbkdf2_params(params, len)?;
     if len == 0 || len > 64 {
         return bad("bad PBKDF2 key length");
     }
     let mut key = vec![0; len];
     prf.pbkdf2(password, salt, rounds, &mut key);
     Ok(key)
+}
+
+/// `PBKDF2-params ::= SEQUENCE { salt OCTET STRING, iterationCount, keyLength OPTIONAL,
+/// prf DEFAULT hmacWithSHA1 }`, with the caller's length as the fallback for an absent one.
+fn pbkdf2_params(params: Option<&[u8]>, len: usize) -> Result<(&[u8], u32, usize, Digest12)> {
+    let mut p = Reader::new(params.unwrap_or(&[])).seq()?;
+    let salt = p.octets()?;
+    let rounds = iterations(&mut p)?;
+    let len = declared_len(&mut p)?.unwrap_or(len);
+    Ok((salt, rounds, len, prf(&mut p)?))
+}
+
+/// The `keyLength` field, when the file states one.
+///
+/// It is read rather than skipped because a file that asks for a length other than the cipher's is
+/// a file whose producer expected a different one, and deriving the cipher's length anyway would
+/// open the content with a key nobody meant.
+fn declared_len(p: &mut Reader<'_>) -> Result<Option<usize>> {
+    if p.rest().first() != Some(&der::INTEGER) {
+        return Ok(None);
+    }
+    usize::try_from(p.int()?)
+        .map(Some)
+        .map_err(|_| Error::Malformed("bad keyLength".into()))
+}
+
+/// The pseudo-random function, `hmacWithSHA1` when the field is absent.
+fn prf(p: &mut Reader<'_>) -> Result<Digest12> {
+    if p.is_empty() {
+        return Ok(Digest12::Sha1);
+    }
+    let (oid, _) = p.alg_id()?;
+    Digest12::from_hmac_oid(oid).ok_or_else(|| Error::Malformed("unsupported PBKDF2 PRF".into()))
 }
 
 /// `MacData ::= SEQUENCE { mac DigestInfo, macSalt OCTET STRING,
@@ -553,16 +573,31 @@ fn pfx_header<'a>(data: &'a [u8], password: Option<&str>) -> Result<&'a [u8]> {
     let mut top = Reader::new(data);
     let mut pfx = top.seq()?;
     top.done("PFX")?;
-    if pfx.int()? != 3 {
-        return bad("not a PKCS #12 version 3 file");
+    version_3(&mut pfx)?;
+    let auth_safe = auth_safe_of(&mut pfx)?;
+    check_integrity(&mut pfx, password, auth_safe)?;
+    Ok(auth_safe)
+}
+
+/// `PFX ::= SEQUENCE { version 3, ... }`: this parser knows one version, and an older file is not
+/// one it can guess at.
+fn version_3(pfx: &mut Reader<'_>) -> Result<()> {
+    if pfx.int()? == 3 {
+        return Ok(());
     }
+    bad("not a PKCS #12 version 3 file")
+}
+
+/// The `authSafe` octets: the only content type this parser reads.
+///
+/// `SignedData` — "public-key integrity mode" — is refused by name rather than skipped: the file
+/// would then carry a MAC nobody verified, which is worse than not opening it.
+fn auth_safe_of<'a>(pfx: &mut Reader<'a>) -> Result<&'a [u8]> {
     let mut ci = pfx.seq()?;
     if ci.oid()? != asn1::oid(ID_DATA) {
         return bad("PKCS #12 with public-key integrity mode is not supported");
     }
-    let auth_safe = Reader::new(ci.expect(der::ctx(0))?).octets()?;
-    check_integrity(&mut pfx, password, auth_safe)?;
-    Ok(auth_safe)
+    Ok(Reader::new(ci.expect(der::ctx(0))?).octets()?)
 }
 
 /// The MAC over the AuthenticatedSafe, when the file states one.

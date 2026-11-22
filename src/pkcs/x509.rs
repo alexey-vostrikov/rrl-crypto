@@ -124,6 +124,48 @@ fn critical_of(e: &mut Reader<'_>) -> Result<bool> {
     }
 }
 
+/// The two fields that come before the names: the version, which the extensions are gated on, and
+/// the serial, which is what a CRL revokes.
+struct Head {
+    version: i64,
+    serial: Vec<u8>,
+}
+
+fn head(t: &mut Reader<'_>, sig_alg: &[u8]) -> Result<Head> {
+    let version = version(t)?;
+    let serial = t.expect(der::INTEGER)?.to_vec();
+    same_algorithm(t, sig_alg)?;
+    Ok(Head { version, serial })
+}
+
+/// Everything from the issuer's name to the extensions.
+struct Body {
+    issuer: Vec<u8>,
+    subject: Vec<u8>,
+    not_before: i64,
+    not_after: i64,
+    key: Spki,
+    extensions: Vec<Extension>,
+}
+
+fn body(t: &mut Reader<'_>, version: i64) -> Result<Body> {
+    let issuer = t.next_raw()?.2.to_vec();
+    let (not_before, not_after) = validity(t)?;
+    let subject = t.next_raw()?.2.to_vec();
+    let key = public_key(t)?;
+    skip_unique_ids(t)?;
+    let extensions = read_cert_extensions(t, version)?;
+    t.done("TBSCertificate")?;
+    Ok(Body {
+        issuer,
+        subject,
+        not_before,
+        not_after,
+        key,
+        extensions,
+    })
+}
+
 /// The three parts a certificate is signed over, and the signature itself.
 struct SignedPart<'a> {
     /// The content of `tbsCertificate`.
@@ -227,30 +269,22 @@ impl Cert {
     pub fn from_der(der: &[u8]) -> Result<Cert> {
         let part = signed_part(der)?;
         let mut t = Reader::new(part.tbs_content);
-        let version = version(&mut t)?;
-        let serial = t.expect(der::INTEGER)?.to_vec();
-        same_algorithm(&mut t, part.sig_alg)?;
-        let issuer = t.next_raw()?.2.to_vec();
-        let (not_before, not_after) = validity(&mut t)?;
-        let subject = t.next_raw()?.2.to_vec();
-        let key = public_key(&mut t)?;
-        skip_unique_ids(&mut t)?;
-        let extensions = read_cert_extensions(&mut t, version)?;
-        t.done("TBSCertificate")?;
+        let head = head(&mut t, part.sig_alg)?;
+        let body = body(&mut t, head.version)?;
         Ok(Cert {
             der: der.to_vec(),
             tbs: part.tbs.to_vec(),
             sig_alg: part.sig_alg.to_vec(),
             signature: part.signature,
-            serial,
-            issuer,
-            subject,
-            not_before,
-            not_after,
-            key_alg: key.alg,
-            key_params: key.params,
-            key: key.key,
-            extensions,
+            serial: head.serial,
+            issuer: body.issuer,
+            subject: body.subject,
+            not_before: body.not_before,
+            not_after: body.not_after,
+            key_alg: body.key.alg,
+            key_params: body.key.params,
+            key: body.key.key,
+            extensions: body.extensions,
         })
     }
 
@@ -353,29 +387,47 @@ impl Cert {
         let mut names = Reader::new(&e.value).seq()?;
         while !names.is_empty() {
             match names.next()? {
-                (t, c) if t == implicit(0) | 0x20 => {
-                    let mut on = Reader::new(c);
-                    if on.oid()? != asn1::oid(ID_PKINIT_SAN) {
-                        continue;
+                (t, c) if is_other_name(t) => {
+                    if let Some(p) = principal_of(c)? {
+                        principals.push(p);
                     }
-                    // `otherName.value` is `[0] EXPLICIT`, and what it wraps is the
-                    // KRB5PrincipalName SEQUENCE. What is handed out is that SEQUENCE's content —
-                    // the two fields, without the tag and length — because that is the shape the
-                    // decoder beside `Principal` takes (`Fields::parse`), and it is parsed here
-                    // once so a malformed one does not travel.
-                    let v = Reader::new(on.expect(der::ctx(0))?);
-                    let content = Reader::new(v.rest()).expect(der::SEQUENCE)?;
-                    let _ = Fields::parse("KRB5PrincipalName", content)?;
-                    principals.push(content.to_vec());
                 }
-                (t, c) if t == implicit(2) => {
-                    dns.push(String::from_utf8_lossy(c).into_owned());
-                }
+                (t, c) if t == implicit(2) => dns.push(String::from_utf8_lossy(c).into_owned()),
+                // RFC 4556 §3.2.2 defines one otherName; every other GeneralName is somebody
+                // else's and is skipped rather than refused.
                 _ => {}
             }
         }
         Ok((principals, dns))
     }
+}
+
+/// Whether this `GeneralName` tag is an `otherName`.
+///
+/// `[0] IMPLICIT OtherName`, and `OtherName` is a SEQUENCE — so the tag is constructed, `0xA0`.
+/// A primitive `0x80` would be an encoding no writer produces for this field, and reading it would
+/// mean parsing a SEQUENCE's content as if it were one.
+fn is_other_name(tag: u8) -> bool {
+    tag == der::ctx(0)
+}
+
+/// The `KRB5PrincipalName` this `otherName` holds, as the content of its SEQUENCE.
+///
+/// `otherName.value` is `[0] EXPLICIT`, and what it wraps is the `KRB5PrincipalName` SEQUENCE. What
+/// is handed out is that SEQUENCE's content — the two fields, without tag and length — because that
+/// is the shape the decoder beside `Principal` takes (`Fields::parse`). It is parsed here once so
+/// that a malformed one does not travel to whoever asked.
+///
+/// An `otherName` naming another OID is not a Kerberos principal and yields nothing.
+fn principal_of(other_name: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut on = Reader::new(other_name);
+    if on.oid()? != asn1::oid(ID_PKINIT_SAN) {
+        return Ok(None);
+    }
+    let mut v = Reader::new(on.expect(der::ctx(0))?);
+    let content = v.expect(der::SEQUENCE)?;
+    Fields::parse("KRB5PrincipalName", content)?;
+    Ok(Some(content.to_vec()))
 }
 
 /// UTCTime (`YYMMDDHHMMSSZ`, years 1950–2049) or GeneralizedTime
@@ -499,20 +551,29 @@ pub mod tests {
     /// Inside every fixture's validity (made 2026, for a century).
     pub const NOW: i64 = 1_900_000_000;
 
+    /// The PEM of every certificate the tests share, by the name they call it.
+    ///
+    /// A table rather than a `match`: the names are data, and ten match arms are ten branches a
+    /// reader has to count to know how many fixtures exist.
+    const FIXTURES: &[(&str, &str)] = &[
+        ("ca", include_str!("testdata/ca.pem")),
+        ("inter", include_str!("testdata/inter.pem")),
+        ("kdc", include_str!("testdata/kdc.pem")),
+        ("host", include_str!("testdata/host.pem")),
+        ("leafsigned", include_str!("testdata/leafsigned.pem")),
+        ("sub", include_str!("testdata/sub.pem")),
+        ("subleaf", include_str!("testdata/subleaf.pem")),
+        ("other-ca", include_str!("testdata/other-ca.pem")),
+        ("ec-ca", include_str!("testdata/ec-ca.pem")),
+        ("ec-kdc", include_str!("testdata/ec-kdc.pem")),
+    ];
+
     pub fn fixture(name: &str) -> Cert {
-        let pem = match name {
-            "ca" => include_str!("testdata/ca.pem"),
-            "inter" => include_str!("testdata/inter.pem"),
-            "kdc" => include_str!("testdata/kdc.pem"),
-            "host" => include_str!("testdata/host.pem"),
-            "leafsigned" => include_str!("testdata/leafsigned.pem"),
-            "sub" => include_str!("testdata/sub.pem"),
-            "subleaf" => include_str!("testdata/subleaf.pem"),
-            "other-ca" => include_str!("testdata/other-ca.pem"),
-            "ec-ca" => include_str!("testdata/ec-ca.pem"),
-            "ec-kdc" => include_str!("testdata/ec-kdc.pem"),
-            _ => unreachable!(),
-        };
+        let pem = FIXTURES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no fixture named {name}"))
+            .1;
         parse_certs(pem.as_bytes()).unwrap().remove(0)
     }
 

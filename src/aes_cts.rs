@@ -141,24 +141,37 @@ pub fn decrypt(key: &[u8], iv: &[u8; BLOCK], data: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let mut out = data.to_vec();
-
     if n == BLOCK {
-        let b: &mut [u8; BLOCK] = out.as_mut_slice().try_into().expect("one block");
-        cipher.decrypt_block(b);
-        xor_into(b, iv);
+        one_block(&cipher, iv, &mut out);
         return Ok(out);
     }
-
-    let d = match n % BLOCK {
-        0 => BLOCK,
-        r => r,
-    };
     let nb = n.div_ceil(BLOCK);
     let body = (nb - 2) * BLOCK;
+    cbc_prefix(&cipher, iv, &mut out, data, body);
+    last_two(&cipher, iv, &mut out, data, body, last_len(n), nb);
+    Ok(out)
+}
 
-    // Every block before the last two is plain CBC, and CBC decryption is
-    // independent per block, so all of them at once; the chaining value is
-    // still in `data`.
+/// Exactly one block in: CBC over one block is a decrypt and an XOR with the IV.
+fn one_block(cipher: &Aes, iv: &[u8; BLOCK], out: &mut [u8]) {
+    let b: &mut [u8; BLOCK] = out.try_into().expect("one block");
+    cipher.decrypt_block(b);
+    xor_into(b, iv);
+}
+
+/// The length of the last block, which is short when the input is not a whole number of blocks.
+fn last_len(n: usize) -> usize {
+    match n % BLOCK {
+        0 => BLOCK,
+        r => r,
+    }
+}
+
+/// Every block before the last two: plain CBC, and independent per block, so all at once.
+///
+/// The chaining values are still in `data`, which is why the ciphertext is read rather than the
+/// output: the block just decrypted has already overwritten its own chaining value.
+fn cbc_prefix(cipher: &Aes, iv: &[u8; BLOCK], out: &mut [u8], data: &[u8], body: usize) {
     cipher.decrypt_blocks(&mut out[..body]);
     #[allow(clippy::chunks_exact_to_as_chunks)] // see the note above
     for (i, b) in out[..body].chunks_exact_mut(BLOCK).enumerate() {
@@ -171,22 +184,30 @@ pub fn decrypt(key: &[u8], iv: &[u8; BLOCK], data: &[u8]) -> Result<Vec<u8>> {
             *x ^= p;
         }
     }
+}
 
-    // C_{nb-2}, or the IV when there are only two blocks.
+/// The last two blocks, where the ciphertext stealing happens: `C_nb` is a whole block and the
+/// tail is the first `d` octets of `C_{nb-1}`, whose remaining octets reappear inside the
+/// decryption of `C_nb` because the plaintext there was the zero extension.
+fn last_two(
+    cipher: &Aes,
+    iv: &[u8; BLOCK],
+    out: &mut [u8],
+    data: &[u8],
+    body: usize,
+    d: usize,
+    nb: usize,
+) {
+    // `C_{nb-2}`, or the IV when there are only two blocks.
     let mut prev = *iv;
     if nb > 2 {
         prev.copy_from_slice(&data[body - BLOCK..body]);
     }
-
-    // The full block at `body` is C_nb; the truncated one at the tail is the
-    // first d octets of C_{nb-1}.
     let mut z = [0u8; BLOCK];
     z.copy_from_slice(&data[body..body + BLOCK]);
     cipher.decrypt_block(&mut z); // z = (P_nb || 0*) XOR C_{nb-1}
     let tail = &data[body + BLOCK..];
 
-    // The stolen octets of C_{nb-1} reappear in z, because the plaintext there
-    // was the zero extension.
     let mut p_nm1 = [0u8; BLOCK];
     p_nm1[..d].copy_from_slice(tail);
     p_nm1[d..].copy_from_slice(&z[d..]);
@@ -197,7 +218,6 @@ pub fn decrypt(key: &[u8], iv: &[u8; BLOCK], data: &[u8]) -> Result<Vec<u8>> {
     for ((o, z), t) in out[body + BLOCK..].iter_mut().zip(z).zip(tail) {
         *o = z ^ t;
     }
-    Ok(out)
 }
 
 #[cfg(test)]
