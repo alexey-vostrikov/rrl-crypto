@@ -676,78 +676,122 @@ pub fn decode_oid(context: &str, content: &[u8]) -> Result<String> {
 pub fn as_utc_time(context: &str, content: &[u8]) -> Result<i64> {
     let text = std::str::from_utf8(content)
         .map_err(|_| DerError(format!("{context}: UTCTime is not ASCII")))?;
+    let (fields, zone) = utc_fields(context, text)?;
+    fields.in_range(context, text)?;
+    let at = crate::time::parse_generalized_time(&fields.generalized())
+        .ok_or_else(|| DerError(format!("{context}: UTCTime {text:?} is not a real date")))?;
+    Ok(at - utc_zone(context, zone)?)
+}
+
+/// The fields of a `UTCTime`, and the zone that follows them.
+struct UtcFields {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+impl UtcFields {
+    /// The same instant as `GeneralizedTime`, which is what the calendar check takes.
+    fn generalized(&self) -> String {
+        format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+
+    /// Every field inside the range the calendar allows.
+    ///
+    /// `second` admits 60: a leap second is legal here and the calendar check below is what
+    /// refuses a date that does not exist.
+    fn in_range(&self, context: &str, text: &str) -> Result<()> {
+        let ok = (1..=12).contains(&self.month)
+            && (1..=31).contains(&self.day)
+            && self.hour <= 23
+            && self.minute <= 59
+            && self.second <= 60;
+        if ok {
+            return Ok(());
+        }
+        err(
+            context,
+            format!("UTCTime {text:?} has a field out of range"),
+        )
+    }
+}
+
+/// Reads `YYMMDDHHMM[SS]` and returns what follows it.
+///
+/// Seconds are optional and what follows the ten digits decides, not the length — a five-octet zone
+/// makes `…HHMM+0200` as long as `…HHMMSSZ`, so counting octets cannot tell them apart.
+fn utc_fields<'a>(context: &str, text: &'a str) -> Result<(UtcFields, &'a str)> {
     if text.len() < 11 {
         return err(context, format!("UTCTime {text:?} is too short"));
     }
-    let digits = |a: usize, b: usize| -> Result<i64> {
-        text.get(a..b)
-            .and_then(|s| s.parse::<i64>().ok())
-            .ok_or_else(|| {
-                DerError(format!(
-                    "{context}: UTCTime {text:?} is not numeric where digits are required"
-                ))
-            })
+    let digits = |a: usize, b: usize| two_digits(context, text, a, b);
+    let (second, zone) = match text.get(10..12) {
+        Some(s) if s.bytes().all(|b| b.is_ascii_digit()) => (digits(10, 12)?, &text[12..]),
+        _ => (0, &text[10..]),
     };
-    let yy = digits(0, 2)?;
-    let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
-    let month = digits(2, 4)?;
-    let day = digits(4, 6)?;
-    let hour = digits(6, 8)?;
-    let minute = digits(8, 10)?;
-    // Seconds are optional: `YYMMDDHHMM` and `YYMMDDHHMMSS` are both legal. What follows the ten
-    // digits decides, not the length — a five-octet zone makes `…HHMM+0200` as long as
-    // `…HHMMSSZ`, so counting octets cannot tell them apart.
-    let has_seconds = text
-        .get(10..12)
-        .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()));
-    let (second, rest) = if has_seconds {
-        (digits(10, 12)?, &text[12..])
-    } else {
-        (0, &text[10..])
+    let fields = UtcFields {
+        year: utc_year(digits(0, 2)?),
+        month: digits(2, 4)?,
+        day: digits(4, 6)?,
+        hour: digits(6, 8)?,
+        minute: digits(8, 10)?,
+        second,
     };
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    Ok((fields, zone))
+}
+
+/// RFC 5280 §4.1.2.5.1: `50`..`99` are 1950..1999 and `00`..`49` are 2000..2049.
+///
+/// The window is a trap in the other direction too: `2000 + yy` puts a certificate issued in 1999 a
+/// century into the future, where it never expires.
+fn utc_year(yy: i64) -> i64 {
+    if yy >= 50 { 1900 + yy } else { 2000 + yy }
+}
+
+/// Two decimal digits at `a..b`.
+fn two_digits(context: &str, text: &str, a: usize, b: usize) -> Result<i64> {
+    text.get(a..b)
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| {
+            DerError(format!(
+                "{context}: UTCTime {text:?} is not numeric where digits are required"
+            ))
+        })
+}
+
+/// The offset the zone subtracts, in seconds: zero for `Z`, otherwise `±hhmm`.
+///
+/// A certificate dated in local time is rare and legal, so "no zone" is not assumed to be one.
+fn utc_zone(context: &str, zone: &str) -> Result<i64> {
+    if zone == "Z" || zone == "z" {
+        return Ok(0);
+    }
+    if zone.len() != 5 {
         return err(
             context,
-            format!("UTCTime {text:?} has a field out of range"),
+            format!("UTCTime zone {zone:?} is neither Z nor an offset"),
         );
     }
-    let mut seconds = crate::time::parse_generalized_time(&format!(
-        "{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z"
-    ))
-    .ok_or_else(|| DerError(format!("{context}: UTCTime {text:?} is not a real date")))?;
-    // The zone: `Z`, or an offset that has to be subtracted to reach UTC. A certificate dated in
-    // local time is rare and legal, so "no zone" is not assumed to be one.
-    match rest {
-        "Z" | "z" => {}
-        _ if rest.len() == 5 => {
-            let sign = match &rest[..1] {
-                "+" => 1,
-                "-" => -1,
-                other => {
-                    return err(context, format!("UTCTime zone {other:?} is not an offset"));
-                }
-            };
-            let hh: i64 = rest[1..3].parse().map_err(|_| {
-                DerError(format!("{context}: UTCTime zone {rest:?} is not numeric"))
-            })?;
-            let mm: i64 = rest[3..5].parse().map_err(|_| {
-                DerError(format!("{context}: UTCTime zone {rest:?} is not numeric"))
-            })?;
-            seconds -= sign * (hh * 3600 + mm * 60);
-        }
-        other => {
-            return err(
-                context,
-                format!("UTCTime zone {other:?} is neither Z nor an offset"),
-            );
-        }
-    }
-    Ok(seconds)
+    let sign = match &zone[..1] {
+        "+" => 1,
+        "-" => -1,
+        other => return err(context, format!("UTCTime zone {other:?} is not an offset")),
+    };
+    let hh = zone_digits(context, zone, 1, 3)?;
+    let mm = zone_digits(context, zone, 3, 5)?;
+    Ok(sign * (hh * 3600 + mm * 60))
+}
+
+fn zone_digits(context: &str, zone: &str, a: usize, b: usize) -> Result<i64> {
+    zone.get(a..b)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| DerError(format!("{context}: UTCTime zone {zone:?} is not numeric")))
 }
 
 #[cfg(test)]

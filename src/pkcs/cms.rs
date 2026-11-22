@@ -115,44 +115,64 @@ pub fn decrypt_enveloped(
     key: &rsa::PrivateKey,
     cert: &Cert,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut ed = envelope(content_info)?;
+    let recipient = key_transport_recipient(&mut ed)?;
+    let cek = unwrap_key(recipient, key, cert)?;
+    content_field(&mut ed, &cek)
+}
+
+/// The `EnvelopedData` this `ContentInfo` carries, positioned at its first field.
+fn envelope(content_info: &[u8]) -> Result<Reader<'_>> {
     let mut ci = Reader::new(content_info).seq()?;
     if ci.oid()? != asn1::oid(ID_ENVELOPED_DATA).as_slice() {
         return err("the KDC's reply key is not an EnvelopedData");
     }
     let enveloped = ci.expect(der::ctx(0))?;
     ci.done("ContentInfo")?;
+    let mut ed = Reader::new(enveloped);
+    ed.seq()
+}
 
-    let mut ed = Reader::new(enveloped).seq()?;
-    ed.uint()?;
+/// The one `RecipientInfo` this client can open: key transport.
+///
+/// Leaves `ed` positioned at the encrypted content. Key agreement is refused by name rather than
+/// skipped: it is a recipient type this client implements nothing of, and a message encrypted under
+/// it cannot be opened by trying the others.
+fn key_transport_recipient<'a>(ed: &mut Reader<'a>) -> Result<&'a [u8]> {
+    ed.uint()?; // version
     if ed.optional(der::ctx(0))?.is_some() {
         return err("the reply key's EnvelopedData carries an originatorInfo");
     }
     // `recipientInfos SET OF RecipientInfo`: the same encoding as a SEQUENCE, a different tag.
     let mut recipients = Reader::new(ed.expect(0x31)?);
+    one_key_transport(&mut recipients)
+}
+
+/// The first `KeyTransRecipientInfo` of the set, and whether a `[1]` choice was met.
+fn one_key_transport<'a>(recipients: &mut Reader<'a>) -> Result<&'a [u8]> {
     let mut found = None;
     while !recipients.is_empty() {
         let (tag, content) = recipients.next()?;
-        if tag == der::SEQUENCE && found.is_none() {
-            found = Some(content);
-        } else if tag == der::ctx(1) {
-            return err(
-                "the reply key uses CMS key agreement, not key transport (nothing agreed a KEK)",
-            );
+        match tag {
+            der::SEQUENCE if found.is_none() => found = Some(content),
+            t if t == der::ctx(1) => {
+                return err(
+                    "the reply key uses CMS key agreement, not key transport (nothing agreed a KEK)",
+                );
+            }
+            _ => {}
         }
     }
-    let ktri = found.ok_or_else(|| {
+    found.ok_or_else(|| {
         DerError("the reply key uses a recipient type this client does not implement".into())
-    })?;
+    })
+}
 
+/// Unwraps the content-encryption key with the certificate it was wrapped to.
+fn unwrap_key(ktri: &[u8], key: &rsa::PrivateKey, cert: &Cert) -> Result<Vec<u8>> {
     let mut ktri = Reader::new(ktri);
-    ktri.uint()?;
-    let (issuer, serial) = {
-        let mut rid = ktri.seq()?;
-        // The issuer is compared as the whole `Name` TLV, the serial as the INTEGER's content.
-        let issuer = rid.next_raw()?.2.to_vec();
-        let serial = asn1::uint_content(rid.next_raw()?.1)?.to_vec();
-        (issuer, serial)
-    };
+    ktri.uint()?; // version
+    let (issuer, serial) = recipient_identity(&mut ktri)?;
     if issuer != cert.issuer || serial != cert.serial {
         return err("the reply key is encrypted to another certificate");
     }
@@ -162,8 +182,20 @@ pub fn decrypt_enveloped(
     }
     let wrapped = ktri.octets()?.to_vec();
     ktri.done("KeyTransRecipientInfo")?;
-    let cek = key.decrypt_pkcs1_v15(&wrapped)?;
+    key.decrypt_pkcs1_v15(&wrapped)
+}
 
+/// The certificate a `KeyTransRecipientInfo` names, as `(issuer TLV, serial content)`.
+fn recipient_identity(ktri: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut rid = ktri.seq()?;
+    // The issuer is compared as the whole `Name` TLV, the serial as the INTEGER's content.
+    let issuer = rid.next_raw()?.2.to_vec();
+    let serial = asn1::uint_content(rid.next_raw()?.1)?.to_vec();
+    Ok((issuer, serial))
+}
+
+/// The content type and the plaintext of the encrypted content.
+fn content_field(ed: &mut Reader<'_>, cek: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut eci = ed.seq()?;
     let content_type = eci.oid()?.to_vec();
     let (alg, params) = eci.alg_id()?;
@@ -175,20 +207,22 @@ pub fn decrypt_enveloped(
     if tag != asn1::implicit(0) && tag != der::ctx(0) {
         return err("the reply key's content encryption carries no ciphertext");
     }
-    let plaintext = if alg == asn1::oid(ID_AES256_CBC).as_slice() {
-        aes_cbc(false, &cek, &iv, ciphertext)?
-    } else if alg == asn1::oid(ID_AES128_CBC).as_slice() {
-        aes_cbc(
-            false,
-            cek.get(..16)
-                .ok_or_else(|| DerError("a short key".into()))?,
-            &iv,
-            ciphertext,
-        )?
-    } else {
-        return err("the reply key's content encryption is not AES-CBC");
-    };
+    let plaintext = decrypt_content(alg, cek, &iv, ciphertext)?;
     Ok((content_type, plaintext))
+}
+
+/// AES-CBC, in the two key sizes the RFC names for CMS.
+fn decrypt_content(alg: &[u8], cek: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    if alg == asn1::oid(ID_AES256_CBC).as_slice() {
+        return aes_cbc(false, cek, iv, ciphertext);
+    }
+    if alg == asn1::oid(ID_AES128_CBC).as_slice() {
+        let short = cek
+            .get(..16)
+            .ok_or_else(|| DerError("a short key".into()))?;
+        return aes_cbc(false, short, iv, ciphertext);
+    }
+    err("the reply key's content encryption is not AES-CBC")
 }
 
 /// One AES block, in place: the primitive CBC is built from.
@@ -197,67 +231,127 @@ type BlockFn = Box<dyn Fn(&mut [u8; 16])>;
 /// AES-CBC with PKCS #7 padding, in one direction. Kerberos has CTS of its own; CMS does not, and
 /// this crate asks AES for nothing more than single blocks here.
 fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-    if iv.len() != 16 {
-        return err("the IV is not 16 octets");
-    }
-    let mut prev: [u8; 16] = iv.try_into().unwrap();
-    let block: BlockFn = match (key.len(), encrypt) {
-        (32, true) => {
-            let c =
-                aes::Aes256::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
-            Box::new(move |b: &mut [u8; 16]| c.encrypt_block(b.into()))
-        }
-        (32, false) => {
-            let c =
-                aes::Aes256::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
-            Box::new(move |b: &mut [u8; 16]| c.decrypt_block(b.into()))
-        }
-        (16, true) => {
-            let c =
-                aes::Aes128::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
-            Box::new(move |b: &mut [u8; 16]| c.encrypt_block(b.into()))
-        }
-        (16, false) => {
-            let c =
-                aes::Aes128::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
-            Box::new(move |b: &mut [u8; 16]| c.decrypt_block(b.into()))
-        }
-        _ => return err("the AES key is neither 16 nor 32 octets"),
-    };
-
-    let mut data = input.to_vec();
+    let block = block_fn(key, encrypt)?;
+    let prev: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| DerError("the IV is not 16 octets".into()))?;
     if encrypt {
-        let pad = 16 - data.len() % 16;
-        data.extend(std::iter::repeat_n(pad as u8, pad));
-    } else if data.is_empty() || !data.len().is_multiple_of(16) {
+        return Ok(cbc_encrypt(&block, prev, &padded(input)));
+    }
+    let data = whole_blocks(input)?;
+    unpad(cbc_decrypt(&block, prev, data))
+}
+
+/// The single-block operation, for the key size and direction asked for.
+///
+/// CMS here uses AES only; a key that is neither 128 nor 256 bits is a message the RFC does not
+/// describe, and it is refused rather than padded out to a size that exists.
+fn block_fn(key: &[u8], encrypt: bool) -> Result<BlockFn> {
+    match key.len() {
+        32 => aes_blocks::<aes::Aes256>(key, encrypt),
+        16 => aes_blocks::<aes::Aes128>(key, encrypt),
+        _ => err("the AES key is neither 16 nor 32 octets"),
+    }
+}
+
+/// One block function over a 128-bit cipher, in the direction asked for.
+///
+/// The block size is fixed in the bound rather than left to the cipher: `Aes128` and `Aes256` both
+/// have a sixteen-octet block, and saying so is what lets the closure take and return `[u8; 16]`
+/// without a copy at every call.
+fn aes_blocks<C>(key: &[u8], encrypt: bool) -> Result<BlockFn>
+where
+    C: aes::cipher::BlockSizeUser<BlockSize = aes::cipher::consts::U16>
+        + aes::cipher::BlockCipherEncrypt
+        + aes::cipher::BlockCipherDecrypt
+        + aes::cipher::KeyInit
+        + 'static,
+{
+    let cipher = <C as aes::cipher::KeyInit>::new_from_slice(key)
+        .map_err(|_| DerError("a bad AES key".into()))?;
+    Ok(if encrypt {
+        Box::new(move |b: &mut [u8; 16]| crypt::<C>(b, |block| cipher.encrypt_block(block)))
+    } else {
+        Box::new(move |b: &mut [u8; 16]| crypt::<C>(b, |block| cipher.decrypt_block(block)))
+    })
+}
+
+/// Runs one block through `f`, keeping the plain array as the boundary.
+fn crypt<C>(b: &mut [u8; 16], f: impl Fn(&mut aes::cipher::Block<C>))
+where
+    C: aes::cipher::BlockSizeUser<BlockSize = aes::cipher::consts::U16>,
+{
+    let mut block = aes::cipher::Block::<C>::try_from(&b[..]).expect("a sixteen-octet block");
+    f(&mut block);
+    b.copy_from_slice(&block);
+}
+
+/// The plaintext with PKCS #7 padding: always at least one octet, so a full block gets a block.
+fn padded(input: &[u8]) -> Vec<u8> {
+    let pad = 16 - input.len() % 16;
+    let mut data = input.to_vec();
+    data.extend(std::iter::repeat_n(pad as u8, pad));
+    data
+}
+
+/// The ciphertext, which has to be whole blocks and not nothing.
+fn whole_blocks(input: &[u8]) -> Result<&[u8]> {
+    if input.is_empty() || !input.len().is_multiple_of(16) {
         return err("the ciphertext is not whole blocks");
     }
+    Ok(input)
+}
+
+/// CBC in the encrypting direction: each block is xored with the previous ciphertext.
+fn cbc_encrypt(block: &BlockFn, mut prev: [u8; 16], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for chunk in data.chunks(16) {
-        let mut b: [u8; 16] = chunk.try_into().unwrap();
-        if encrypt {
-            for (x, p) in b.iter_mut().zip(prev.iter()) {
-                *x ^= *p;
-            }
-            block(&mut b);
-            prev = b;
-        } else {
-            block(&mut b);
-            for (x, p) in b.iter_mut().zip(prev.iter()) {
-                *x ^= *p;
-            }
-            prev = chunk.try_into().unwrap();
-        }
+        let mut b = to_block(chunk);
+        xor(&mut b, &prev);
+        block(&mut b);
+        prev = b;
         out.extend_from_slice(&b);
     }
-    if !encrypt {
-        let pad = *out.last().unwrap() as usize;
-        if pad == 0 || pad > 16 || out[out.len() - pad..].iter().any(|&b| b as usize != pad) {
-            return err("the padding is not PKCS #7");
-        }
-        out.truncate(out.len() - pad);
+    out
+}
+
+/// CBC in the decrypting direction: each block is xored with the ciphertext before it.
+fn cbc_decrypt(block: &BlockFn, mut prev: [u8; 16], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(16) {
+        let mut b = to_block(chunk);
+        block(&mut b);
+        xor(&mut b, &prev);
+        prev = to_block(chunk);
+        out.extend_from_slice(&b);
     }
+    out
+}
+
+/// A sixteen-octet block; the caller has already established the chunks are that long.
+fn to_block(chunk: &[u8]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(chunk);
+    b
+}
+
+fn xor(b: &mut [u8; 16], p: &[u8; 16]) {
+    for (x, y) in b.iter_mut().zip(p.iter()) {
+        *x ^= *y;
+    }
+}
+
+/// Removes PKCS #7 padding, refusing anything that is not.
+///
+/// The padding octets are checked, not just the count: a block whose last octets disagree says the
+/// key was wrong, and accepting it would hand a caller bytes that were never the plaintext.
+fn unpad(mut out: Vec<u8>) -> Result<Vec<u8>> {
+    let pad = out.last().copied().unwrap_or(0) as usize;
+    let tail = out.len().saturating_sub(pad);
+    if pad == 0 || pad > 16 || out[tail..].iter().any(|&b| b as usize != pad) {
+        return err("the padding is not PKCS #7");
+    }
+    out.truncate(out.len() - pad);
     Ok(out)
 }
 
@@ -380,92 +474,167 @@ pub fn verify(
     revocation: crl::Policy<'_>,
     now: i64,
 ) -> Result<Verified> {
-    let mut sd = Reader::new(signed_data_content(data)?).seq()?;
+    let sd = open_signed_data(data, content_type)?;
+    let si = signer_info(&sd.certs, sd.signer, content_type, &sd.content)?;
+    trace("SignerInfo");
+    let signer = &sd.certs[si.index];
+    let key = signer.public_key()?;
+    // MIT's KDC before 1.22 labels ECDSA signatures sha256WithRSAEncryption; OpenSSL goes by the
+    // signer's key, and so does this. The signature must still verify under that key.
+    let alg = match (&key, si.alg) {
+        (PublicKey::Ec(_), SigAlg::Rsa(h)) => SigAlg::Ecdsa(h),
+        _ => si.alg,
+    };
+    let signed = der::tlv(asn1::SET, si.attrs);
+    if !key.verify(alg, &si.hash.digest(&signed), &si.signature) {
+        return err("SignedData signature does not verify");
+    }
+    let path = x509::verify_chain(signer, &sd.certs, anchors, now)?;
+    crl::check_chain(&path, revocation, &sd.crls, now)?;
+    Ok(Verified {
+        content: sd.content,
+        signer: signer.clone(),
+    })
+}
 
+/// A `SignedData` opened far enough to know what it signs, who signed it, and what travelled with
+/// the signature.
+struct SignedData<'a> {
+    content: Vec<u8>,
+    certs: Vec<Cert>,
+    crls: Vec<crl::Crl>,
+    /// The single `SignerInfo`, as it arrived: tag and length included.
+    signer: &'a [u8],
+}
+
+/// Reads the `SignedData` fields in the order the structure gives them.
+///
+/// `version` and `digestAlgorithms` are read and dropped: every signer names its own digest, so the
+/// set at this level says nothing a verifier may rely on — an implementation that trusted it would
+/// accept a signature whose digest was never listed.
+fn open_signed_data<'a>(data: &'a [u8], content_type: &str) -> Result<SignedData<'a>> {
+    let mut sd = Reader::new(signed_data_content(data)?).seq()?;
     sd.int()?; // version
-    sd.expect(asn1::SET)?; // digestAlgorithms: the SignerInfo names its own
+    sd.expect(asn1::SET)?; // digestAlgorithms
     trace("digestAlgorithms");
+    let content = encapsulated_content(&mut sd, content_type)?;
+    let (certs, crls) = context(&mut sd)?;
+    let signer = single_signer(&mut sd)?;
+    Ok(SignedData {
+        content,
+        certs,
+        crls,
+        signer,
+    })
+}
+
+/// The certificates and revocation lists that travelled with the signature.
+///
+/// `crls [1] IMPLICIT SET OF RevocationInfoChoice` also admits `OtherRevocationInfoFormat`, which
+/// is skipped on the same terms as the certificate choices: neither can revoke anything here.
+fn context<'a>(sd: &mut Reader<'a>) -> Result<(Vec<Cert>, Vec<crl::Crl>)> {
+    let certs = match sd.optional(der::ctx(0))? {
+        None => Vec::new(),
+        Some(set) => certificates(set)?,
+    };
+    let crls = match sd.optional(der::ctx(1))? {
+        None => Vec::new(),
+        Some(set) => revocation_lists(set)?,
+    };
+    trace("certificates and crls");
+    Ok((certs, crls))
+}
+
+/// The content type a `SignedData` claims and the octets it holds.
+fn encapsulated_content(sd: &mut Reader<'_>, content_type: &str) -> Result<Vec<u8>> {
     let mut encap = sd.seq()?;
-    if encap.oid()? != asn1::oid(content_type) {
+    if encap.oid()? != asn1::oid(content_type).as_slice() {
         return err("SignedData carries the wrong content type");
     }
     trace("eContentType");
     let content = Reader::new(encap.expect(der::ctx(0))?).octets()?.to_vec();
     encap.done("EncapsulatedContentInfo")?;
+    Ok(content)
+}
+
+/// The certificates sent with the signature: plain ones only.
+///
+/// `CertificateChoices` also admits extended and attribute certificates; neither carries a key that
+/// can verify a `SignerInfo`, so they are skipped rather than refused.
+fn certificates(set: &[u8]) -> Result<Vec<Cert>> {
     let mut certs = Vec::new();
-    if let Some(set) = sd.optional(der::ctx(0))? {
-        let mut r = Reader::new(set);
-        while !r.is_empty() {
-            let (tag, _, raw) = r.next_raw()?;
-            // Only plain certificates; other CertificateChoices are skipped.
-            if tag == der::SEQUENCE {
-                certs.push(Cert::from_der(raw)?);
-            }
+    let mut r = Reader::new(set);
+    while !r.is_empty() {
+        let (tag, _, raw) = r.next_raw()?;
+        if tag == der::SEQUENCE {
+            certs.push(Cert::from_der(raw)?);
         }
     }
-    // crls [1] IMPLICIT SET OF RevocationInfoChoice: CertificateLists;
-    // the other choice ([1] OtherRevocationInfoFormat) is skipped.
+    Ok(certs)
+}
+
+/// The `CertificateList`s sent with the signature, on the same terms as [`certificates`].
+fn revocation_lists(set: &[u8]) -> Result<Vec<crl::Crl>> {
     let mut crls = Vec::new();
-    if let Some(set) = sd.optional(der::ctx(1))? {
-        let mut r = Reader::new(set);
-        while !r.is_empty() {
-            let (tag, _, raw) = r.next_raw()?;
-            if tag == der::SEQUENCE {
-                crls.push(crl::Crl::from_der(raw)?);
-            }
+    let mut r = Reader::new(set);
+    while !r.is_empty() {
+        let (tag, _, raw) = r.next_raw()?;
+        if tag == der::SEQUENCE {
+            crls.push(crl::Crl::from_der(raw)?);
         }
     }
-    trace("certificates and crls");
+    Ok(crls)
+}
+
+/// The `signerInfos` set, which must hold exactly one `SignerInfo`.
+///
+/// One, because this crate verifies one signer: a message with two is refused rather than half
+/// verified, and a message with none says who signed it nowhere.
+fn single_signer<'a>(sd: &mut Reader<'a>) -> Result<&'a [u8]> {
     let mut infos = Reader::new(sd.expect(asn1::SET)?);
     sd.done("SignedData")?;
     if infos.is_empty() {
         return err("SignedData has no signer");
     }
-    let mut si = infos.seq()?;
+    let (tag, _, raw) = infos.next_raw()?;
+    if tag != der::SEQUENCE {
+        return err("SignerInfo is not a SEQUENCE");
+    }
     if !infos.is_empty() {
         return err("SignedData with more than one signer");
     }
+    Ok(raw)
+}
 
-    trace("signerInfos");
+/// What one `SignerInfo` says: which certificate signed, with what, and over which attributes.
+struct SignerInfo<'a> {
+    /// The index of the signer's certificate in the set the message carried.
+    index: usize,
+    hash: Hash,
+    alg: SigAlg,
+    /// The signed attributes, still encoded as a SET OF — the octets the signature covers.
+    attrs: &'a [u8],
+    signature: Vec<u8>,
+}
+
+/// Reads a `SignerInfo` and checks the attributes it states against the content.
+///
+/// The attribute check lives here rather than after the caller has the parts, because a signature
+/// that verifies over attributes which do not name this content proves only that somebody holding
+/// the key signed something — not that they signed this.
+fn signer_info<'a>(
+    certs: &[Cert],
+    signer: &'a [u8],
+    content_type: &str,
+    content: &[u8],
+) -> Result<SignerInfo<'a>> {
+    let mut si = Reader::new(signer).seq()?;
     si.int()?; // version
     // `SignerIdentifier ::= CHOICE { issuerAndSerialNumber SEQUENCE, subjectKeyIdentifier [0] }`.
     // Heimdal signs with the key identifier and MIT with the issuer and serial — both are legal,
     // and a verifier that knows only one of them interops with only one of them.
     let (sid_tag, sid) = si.next()?;
-    let signer_index = match sid_tag {
-        der::SEQUENCE => {
-            let mut sid = Reader::new(sid);
-            let issuer = sid.next_raw()?.2;
-            let serial = sid.expect(der::INTEGER)?;
-            sid.done("IssuerAndSerialNumber")?;
-            certs
-                .iter()
-                .position(|c| c.issuer == issuer && c.serial == serial)
-                .ok_or_else(|| {
-                    DerError("SignedData does not include the signer's certificate".into())
-                })?
-        }
-        // `SubjectKeyIdentifier ::= OCTET STRING`, and a `[0]` choice around it is written either
-        // implicitly (primitive, the content is the key) or, as Heimdal writes it, constructed
-        // with the OCTET STRING inside.
-        tag if tag == asn1::implicit(0) || tag == der::ctx(0) => {
-            let key = if tag == der::ctx(0) {
-                Reader::new(sid).octets()?
-            } else {
-                sid
-            };
-            match certs.iter().position(|c| c.subject_key_id() == Some(key)) {
-                Some(i) => i,
-                None => {
-                    return err(
-                        "SignedData does not include the certificate with the signer's key \
-                         identifier",
-                    );
-                }
-            }
-        }
-        _ => return err("unsupported SignerIdentifier in SignedData"),
-    };
+    let index = signer_of(certs, sid_tag, sid)?;
     trace("sid");
     let (digest_oid, _) = si.alg_id()?;
     let hash = Hash::from_oid(digest_oid)
@@ -473,60 +642,135 @@ pub fn verify(
     let attrs = si
         .optional(der::ctx(0))?
         .ok_or_else(|| DerError("SignedData without signed attributes".into()))?;
-    // The signature algorithm names its own hash, which must be the
-    // digest algorithm's; bare rsaEncryption takes the digest algorithm's.
     let (sig_oid, _) = si.alg_id()?;
-    let alg = match SigAlg::from_oid(sig_oid) {
-        Some(a) if a.hash() == hash => a,
-        None if sig_oid == asn1::oid(rsa::RSA_ENCRYPTION) => SigAlg::Rsa(hash),
-        _ => return err("unsupported or inconsistent SignedData signature algorithm"),
-    };
-    let signature = si.octets()?;
+    let alg = signature_alg(sig_oid, hash)?;
+    let signature = si.octets()?.to_vec();
     si.optional(der::ctx(1))?; // unsignedAttrs
     si.done("SignerInfo")?;
+    signed_attributes(attrs, content_type, content, hash)?;
+    Ok(SignerInfo {
+        index,
+        hash,
+        alg,
+        attrs,
+        signature,
+    })
+}
 
-    trace("SignerInfo");
-    let mut content_type_ok = false;
-    let mut digest_ok = false;
+/// Which certificate in the set is the signer, by either identifier the RFC allows.
+fn signer_of(certs: &[Cert], tag: u8, sid: &[u8]) -> Result<usize> {
+    match tag {
+        der::SEQUENCE => signer_by_serial(certs, sid),
+        t if t == asn1::implicit(0) || t == der::ctx(0) => signer_by_key_id(certs, t, sid),
+        _ => err("unsupported SignerIdentifier in SignedData"),
+    }
+}
+
+/// The signer named by issuer and serial number.
+fn signer_by_serial(certs: &[Cert], sid: &[u8]) -> Result<usize> {
+    let mut sid = Reader::new(sid);
+    // The issuer is compared as the whole `Name` TLV, the serial as the INTEGER's content.
+    let issuer = sid.next_raw()?.2;
+    let serial = sid.expect(der::INTEGER)?;
+    sid.done("IssuerAndSerialNumber")?;
+    certs
+        .iter()
+        .position(|c| c.issuer == issuer && c.serial == serial)
+        .ok_or_else(|| DerError("SignedData does not include the signer's certificate".into()))
+}
+
+/// The signer named by `SubjectKeyIdentifier`.
+///
+/// `SubjectKeyIdentifier ::= OCTET STRING`, and a `[0]` choice around it is written either
+/// implicitly (primitive, the content is the key) or, as Heimdal writes it, constructed with the
+/// OCTET STRING inside.
+fn signer_by_key_id(certs: &[Cert], tag: u8, sid: &[u8]) -> Result<usize> {
+    let key = if tag == der::ctx(0) {
+        Reader::new(sid).octets()?
+    } else {
+        sid
+    };
+    certs
+        .iter()
+        .position(|c| c.subject_key_id() == Some(key))
+        .ok_or_else(|| {
+            DerError(
+                "SignedData does not include the certificate with the signer's key identifier"
+                    .into(),
+            )
+        })
+}
+
+/// The signature algorithm, which has to agree with the digest the signer named.
+///
+/// A signature algorithm naming its own hash and a digest algorithm naming a different one is not a
+/// message to reconcile: one of the two is wrong, and verifying with either is guessing.
+fn signature_alg(oid: &[u8], hash: Hash) -> Result<SigAlg> {
+    match SigAlg::from_oid(oid) {
+        Some(a) if a.hash() == hash => Ok(a),
+        None if oid == asn1::oid(rsa::RSA_ENCRYPTION).as_slice() => Ok(SigAlg::Rsa(hash)),
+        _ => err("unsupported or inconsistent SignedData signature algorithm"),
+    }
+}
+
+/// Checks the two attributes a signer has to state: the content type it signed, and the digest of
+/// that content.
+#[derive(Default)]
+struct SignedAttrs {
+    content_type: bool,
+    digest: bool,
+}
+
+fn signed_attributes(attrs: &[u8], content_type: &str, content: &[u8], hash: Hash) -> Result<()> {
+    let mut check = SignedAttrs::default();
     let mut a = Reader::new(attrs);
     while !a.is_empty() {
-        let mut attr = a.seq()?;
-        let oid = attr.oid()?;
-        let mut values = Reader::new(attr.expect(asn1::SET)?);
-        attr.done("Attribute")?;
-        let (tag, value) = values.next()?;
-        if !values.is_empty() {
-            return err("a signed attribute with more than one value");
-        }
-        if oid == asn1::oid(ATTR_CONTENT_TYPE) {
-            content_type_ok = tag == asn1::OID && value == asn1::oid(content_type);
-        } else if oid == asn1::oid(ATTR_MESSAGE_DIGEST) {
-            digest_ok = tag == der::OCTET_STRING && value == hash.digest(&content);
-        }
+        check.take(&mut a, content_type, content, hash)?;
     }
-    if !content_type_ok || !digest_ok {
-        return err("SignedData's signed attributes do not match its content");
+    check.pass()
+}
+
+impl SignedAttrs {
+    /// Reads one attribute and records what it settles, if anything.
+    fn take(
+        &mut self,
+        a: &mut Reader<'_>,
+        content_type: &str,
+        content: &[u8],
+        hash: Hash,
+    ) -> Result<()> {
+        let (oid, tag, value) = single_attribute(a)?;
+        if oid == asn1::oid(ATTR_CONTENT_TYPE) {
+            self.content_type = tag == asn1::OID && value == asn1::oid(content_type);
+        } else if oid == asn1::oid(ATTR_MESSAGE_DIGEST) {
+            self.digest = tag == der::OCTET_STRING && value == hash.digest(content);
+        }
+        Ok(())
     }
 
-    let signer = &certs[signer_index];
-    let signed = der::tlv(asn1::SET, attrs);
-    let key = signer.public_key()?;
-    // MIT's KDC before 1.22 labels ECDSA signatures sha256WithRSAEncryption;
-    // OpenSSL goes by the signer's key, and so does this. The signature
-    // must still verify under that key.
-    let alg = match (&key, alg) {
-        (PublicKey::Ec(_), SigAlg::Rsa(h)) => SigAlg::Ecdsa(h),
-        _ => alg,
-    };
-    if !key.verify(alg, &hash.digest(&signed), signature) {
-        return err("SignedData signature does not verify");
+    /// Both attributes were found and both matched.
+    fn pass(self) -> Result<()> {
+        if self.content_type && self.digest {
+            return Ok(());
+        }
+        err("SignedData's signed attributes do not match its content")
     }
-    let path = x509::verify_chain(signer, &certs, anchors, now)?;
-    crl::check_chain(&path, revocation, &crls, now)?;
-    Ok(Verified {
-        content,
-        signer: signer.clone(),
-    })
+}
+
+/// One `Attribute`: its type, and the tag and value of its single value.
+///
+/// One value, because the RFC makes `SET OF AttributeValue` and every attribute this verifier reads
+/// is defined with one: an attribute with two would leave which one was signed undecided.
+fn single_attribute<'a>(a: &mut Reader<'a>) -> Result<(&'a [u8], u8, &'a [u8])> {
+    let mut attr = a.seq()?;
+    let oid = attr.oid()?;
+    let mut values = Reader::new(attr.expect(asn1::SET)?);
+    attr.done("Attribute")?;
+    let (tag, value) = values.next()?;
+    if !values.is_empty() {
+        return err("a signed attribute with more than one value");
+    }
+    Ok((oid, tag, value))
 }
 
 // Test fixtures that a sibling crate builds its own scenarios from. Behind a feature and

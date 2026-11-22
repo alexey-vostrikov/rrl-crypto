@@ -75,6 +75,123 @@ struct Idp {
     only_attribute: bool,
 }
 
+/// The three parts a `CertificateList` is signed over, and the signature itself.
+struct SignedPart<'a> {
+    /// The content of `tbsCertList`, whose length the signature covers as a SEQUENCE.
+    tbs_content: &'a [u8],
+    /// `tbsCertList` whole, tag and length included: what a verifier hashes.
+    tbs: &'a [u8],
+    sig_alg: &'a [u8],
+    signature: Vec<u8>,
+}
+
+/// Splits a `CertificateList` into the signed part and the signature around it.
+fn signed_part(der: &[u8]) -> Result<SignedPart<'_>> {
+    let mut outer = Reader::new(der);
+    let mut c = outer.seq()?;
+    outer.done("CertificateList")?;
+    let (_, tbs_content, tbs) = c.next_raw()?;
+    let (sig_alg, _) = c.alg_id()?;
+    let signature = c.bits()?.to_vec();
+    c.done("CertificateList")?;
+    Ok(SignedPart {
+        tbs_content,
+        tbs,
+        sig_alg,
+        signature,
+    })
+}
+
+/// What `tbsCertList` says before the revoked entries: its version, issuer and two dates.
+struct Header {
+    version: i64,
+    issuer: Vec<u8>,
+    this_update: i64,
+    next_update: Option<i64>,
+}
+
+/// Reads the head of `tbsCertList`, refusing a signature algorithm that disagrees with the outer
+/// one: the two are the same statement, and a list where they differ is one nobody can check.
+fn header(t: &mut Reader<'_>, sig_alg: &[u8]) -> Result<Header> {
+    let version = match t.rest().first() {
+        Some(&der::INTEGER) => t.int()?,
+        _ => 0,
+    };
+    let (inner_alg, _) = t.alg_id()?;
+    if inner_alg != sig_alg {
+        return err("CRL signature algorithms disagree");
+    }
+    let issuer = t.next_raw()?.2.to_vec();
+    let this_update = x509::read_time(t)?;
+    Ok(Header {
+        version,
+        issuer,
+        this_update,
+        next_update: optional_time(t)?,
+    })
+}
+
+/// `nextUpdate`, when the list carries one.
+fn optional_time(t: &mut Reader<'_>) -> Result<Option<i64>> {
+    match t.rest().first() {
+        Some(&tag) if tag == asn1::UTC_TIME || tag == der::GENERALIZED_TIME => {
+            Ok(Some(x509::read_time(t)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One `revokedCertificate`.
+struct Entry {
+    serial: Vec<u8>,
+    /// The entry says the certificate is back: `removeFromCRL`.
+    removed: bool,
+    /// A critical extension this crate does not interpret travelled with the entry.
+    unhandled_critical: bool,
+}
+
+/// The `SEQUENCE OF` revoked entries.
+fn revoked_entries(t: &mut Reader<'_>, version: i64) -> Result<Vec<Entry>> {
+    let mut entries = t.seq()?;
+    let mut out = Vec::new();
+    while !entries.is_empty() {
+        out.push(entry(&mut entries, version)?);
+    }
+    Ok(out)
+}
+
+/// One entry: its serial, its date, and the extensions that may say it is back.
+fn entry(entries: &mut Reader<'_>, version: i64) -> Result<Entry> {
+    let mut e = entries.seq()?;
+    let serial = e.expect(der::INTEGER)?.to_vec();
+    x509::read_time(&mut e)?;
+    let mut out = Entry {
+        serial,
+        removed: false,
+        unhandled_critical: false,
+    };
+    if e.is_empty() {
+        e.done("revokedCertificate")?;
+        return Ok(out);
+    }
+    if version != 1 {
+        return err("entry extensions in a CRL before v2");
+    }
+    let (_, _, raw) = e.next_raw()?;
+    for x in x509::read_extensions(raw)? {
+        if x.oid == asn1::oid(REASON_CODE) {
+            out.removed = Reader::new(&x.value).expect(ENUMERATED)? == [REMOVE_FROM_CRL];
+        }
+        // OpenSSL handles a critical certificateIssuer (it matters only to indirect CRLs) and no
+        // other.
+        if x.critical && x.oid != asn1::oid(CERTIFICATE_ISSUER) {
+            out.unhandled_critical = true;
+        }
+    }
+    e.done("revokedCertificate")?;
+    Ok(out)
+}
+
 impl Crl {
     /// ```text
     /// CertificateList ::= SEQUENCE { tbsCertList, signatureAlgorithm, signatureValue BIT STRING }
@@ -87,38 +204,16 @@ impl Crl {
     ///     crlExtensions [0] EXPLICIT Extensions OPTIONAL }
     /// ```
     pub fn from_der(der: &[u8]) -> Result<Crl> {
-        let mut outer = Reader::new(der);
-        let mut c = outer.seq()?;
-        outer.done("CertificateList")?;
-        let (_, tbs_content, tbs) = c.next_raw()?;
-        let (sig_alg, _) = c.alg_id()?;
-        let signature = c.bits()?.to_vec();
-        c.done("CertificateList")?;
-
-        let mut t = Reader::new(tbs_content);
-        let version = match t.rest().first() {
-            Some(&der::INTEGER) => t.int()?,
-            _ => 0,
-        };
-        let (inner_alg, _) = t.alg_id()?;
-        if inner_alg != sig_alg {
-            return err("CRL signature algorithms disagree");
-        }
-        let issuer = t.next_raw()?.2.to_vec();
-        let this_update = x509::read_time(&mut t)?;
-        let next_update = match t.rest().first() {
-            Some(&tag) if tag == asn1::UTC_TIME || tag == der::GENERALIZED_TIME => {
-                Some(x509::read_time(&mut t)?)
-            }
-            _ => None,
-        };
+        let part = signed_part(der)?;
+        let mut t = Reader::new(part.tbs_content);
+        let h = header(&mut t, part.sig_alg)?;
         let mut crl = Crl {
-            tbs: tbs.to_vec(),
-            sig_alg: sig_alg.to_vec(),
-            signature,
-            issuer,
-            this_update,
-            next_update,
+            tbs: part.tbs.to_vec(),
+            sig_alg: part.sig_alg.to_vec(),
+            signature: part.signature,
+            issuer: h.issuer,
+            this_update: h.this_update,
+            next_update: h.next_update,
             revoked: Vec::new(),
             unhandled_critical: false,
             unusable: false,
@@ -126,44 +221,30 @@ impl Crl {
             akid: None,
         };
         if t.rest().first() == Some(&der::SEQUENCE) {
-            let mut entries = t.seq()?;
-            while !entries.is_empty() {
-                let mut e = entries.seq()?;
-                let serial = e.expect(der::INTEGER)?.to_vec();
-                x509::read_time(&mut e)?;
-                let mut remove = false;
-                if !e.is_empty() {
-                    if version != 1 {
-                        return err("entry extensions in a CRL before v2");
-                    }
-                    let (_, _, raw) = e.next_raw()?;
-                    for x in x509::read_extensions(raw)? {
-                        if x.oid == asn1::oid(REASON_CODE) {
-                            remove = Reader::new(&x.value).expect(ENUMERATED)? == [REMOVE_FROM_CRL];
-                        }
-                        // OpenSSL handles a critical certificateIssuer
-                        // (it matters only to indirect CRLs) and no other.
-                        if x.critical && x.oid != asn1::oid(CERTIFICATE_ISSUER) {
-                            crl.unhandled_critical = true;
-                        }
-                    }
-                }
-                e.done("revokedCertificate")?;
-                if !remove {
-                    crl.revoked.push(serial);
+            for entry in revoked_entries(&mut t, h.version)? {
+                crl.unhandled_critical |= entry.unhandled_critical;
+                if !entry.removed {
+                    crl.revoked.push(entry.serial);
                 }
             }
         }
-        if let Some(exts) = t.optional(der::ctx(0))? {
-            if version != 1 {
-                return err("extensions in a CRL before v2");
-            }
-            for x in x509::read_extensions(exts)? {
-                crl.extension(&x)?;
-            }
-        }
+        crl.read_extensions(&mut t, h.version)?;
         t.done("TBSCertList")?;
         Ok(crl)
+    }
+
+    /// The extensions at the end of the list, which are the CRL's own and not an entry's.
+    fn read_extensions(&mut self, t: &mut Reader<'_>, version: i64) -> Result<()> {
+        let Some(exts) = t.optional(der::ctx(0))? else {
+            return Ok(());
+        };
+        if version != 1 {
+            return err("extensions in a CRL before v2");
+        }
+        for x in x509::read_extensions(exts)? {
+            self.extension(&x)?;
+        }
+        Ok(())
     }
 
     fn extension(&mut self, x: &Extension) -> Result<()> {
