@@ -190,24 +190,52 @@ impl PrivateKey {
     /// (RSA or EC), `RSA PRIVATE KEY` (PKCS #1) or `EC PRIVATE KEY`
     /// (SEC1), unencrypted.
     pub fn from_pem_blocks(blocks: &[(String, Vec<u8>)]) -> Result<PrivateKey> {
+        Self::from_pem_blocks_with_password(blocks, None)
+    }
+
+    /// The first private key among PEM blocks, encrypted or not.
+    ///
+    /// `ENCRYPTED PRIVATE KEY` is the `EncryptedPrivateKeyInfo` of PKCS #8 - what
+    /// `openssl genpkey -aes-256-cbc` writes and what a service's mTLS identity usually is. A block
+    /// of that shape without a password is refused by name rather than skipped: a caller that
+    /// forgot the password has a key it cannot use, and "no unencrypted key found" would send it
+    /// looking for a different file.
+    pub fn from_pem_blocks_with_password(
+        blocks: &[(String, Vec<u8>)],
+        password: Option<&str>,
+    ) -> Result<PrivateKey> {
         for (label, der) in blocks {
             match label.as_str() {
                 "RSA PRIVATE KEY" => return Ok(PrivateKey::Rsa(rsa::PrivateKey::from_der(der)?)),
                 "EC PRIVATE KEY" => {
                     return Ok(PrivateKey::Ec(ec::PrivateKey::from_sec1(der, None)?));
                 }
-                "PRIVATE KEY" => return Self::from_pkcs8(der),
+                "PRIVATE KEY" => return Self::from_der_pkcs8(der),
+                "ENCRYPTED PRIVATE KEY" => {
+                    let password = password.ok_or_else(|| {
+                        DerError(
+                            "an encrypted private key was found and no password was given".into(),
+                        )
+                    })?;
+                    let plain = super::pkcs12::decrypt_private_key_info(der, password)
+                        .map_err(|err| DerError(format!("encrypted private key: {err}")))?;
+                    return Self::from_der_pkcs8(&plain);
+                }
                 _ => {}
             }
         }
         Err(DerError(
-            "no unencrypted RSA or EC private key found".into(),
+            "no RSA or EC private key found in the PEM blocks".into(),
         ))
     }
 
     /// `PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier,
-    /// privateKey OCTET STRING, ... }`.
-    fn from_pkcs8(der: &[u8]) -> Result<PrivateKey> {
+    /// privateKey OCTET STRING, ... }`, from memory.
+    ///
+    /// The same bytes `PRIVATE KEY` carries: a caller that has the DER - from a PKCS #12 key bag, a
+    /// decrypted `ENCRYPTED PRIVATE KEY`, or a secret store that keeps DER and not PEM - does not
+    /// have to wrap it in a PEM envelope to be read here.
+    pub fn from_der_pkcs8(der: &[u8]) -> Result<PrivateKey> {
         let mut r = Reader::new(der);
         let mut s = r.seq()?;
         r.done("PrivateKeyInfo")?;
@@ -314,10 +342,77 @@ mod tests {
         // Nothing that holds a key.
         let none = vec![("CERTIFICATE".to_string(), vec![0x30, 0x00])];
         let e = PrivateKey::from_pem_blocks(&none).unwrap_err();
-        assert!(e.0.contains("no unencrypted RSA or EC private key"), "{e}");
+        assert!(e.0.contains("no RSA or EC private key found"), "{e}");
         assert!(
             PrivateKey::from_pem_blocks(&[]).is_err(),
             "an empty file holds none"
+        );
+    }
+
+    /// The format `openssl genpkey -aes-256-cbc -pass pass:…` writes, which is what an mTLS
+    /// deployment hands a service and what nothing here could read before.
+    ///
+    /// The fixture's unencrypted twin was made from the same key, so the two readers have to agree
+    /// on the key they produce: what is compared is a signature, because two keys that verify for
+    /// each other's signatures are the same pair, and the modulus is private to this module.
+    #[test]
+    fn an_encrypted_pkcs8_key_opens_with_its_password() {
+        let blocks = pem::blocks(include_bytes!("testdata/encrypted-pkcs8.pem")).unwrap();
+        assert_eq!(blocks[0].0, "ENCRYPTED PRIVATE KEY");
+
+        let opened = PrivateKey::from_pem_blocks_with_password(&blocks, Some("rrl-stand")).unwrap();
+        let twin = key(include_bytes!("testdata/plain-twin-pkcs8.pem"));
+
+        let digest = Hash::Sha256.digest(b"encrypted pkcs8");
+        let sig = opened.sign(&digest).unwrap();
+        assert!(
+            twin.public()
+                .verify(SigAlg::Rsa(Hash::Sha256), &digest, &sig),
+            "the encrypted key and its twin are the same key"
+        );
+        let back = twin.sign(&digest).unwrap();
+        assert!(
+            opened
+                .public()
+                .verify(SigAlg::Rsa(Hash::Sha256), &digest, &back),
+            "and in the other direction"
+        );
+    }
+
+    /// A wrong password is a refusal a caller can print, not a panic and not a key of the wrong
+    /// shape: PBES2 authenticates nothing, so the message names both possibilities honestly.
+    #[test]
+    fn a_wrong_password_is_refused_by_name() {
+        let blocks = pem::blocks(include_bytes!("testdata/encrypted-pkcs8.pem")).unwrap();
+        let err = PrivateKey::from_pem_blocks_with_password(&blocks, Some("not-the-password"))
+            .expect_err("a wrong password cannot open the key");
+        assert!(err.0.contains("cannot decrypt"), "{err}");
+        assert!(err.0.contains("password is wrong"), "{err}");
+    }
+
+    /// Without a password the block is named, not skipped: "no key found" would send a caller
+    /// looking for a different file than the one it has.
+    #[test]
+    fn an_encrypted_key_without_a_password_says_so() {
+        let blocks = pem::blocks(include_bytes!("testdata/encrypted-pkcs8.pem")).unwrap();
+        let err = PrivateKey::from_pem_blocks(&blocks).expect_err("no password, no key");
+        assert!(err.0.contains("encrypted private key was found"), "{err}");
+    }
+
+    /// A consumer that keeps DER - a secret store, a PKCS #12 bag, a decrypted envelope - reads the
+    /// key without building a PEM envelope around it first.
+    #[test]
+    fn pkcs8_is_read_from_der_without_a_pem_envelope() {
+        let blocks = pem::blocks(include_bytes!("testdata/plain-twin-pkcs8.pem")).unwrap();
+        let from_der = PrivateKey::from_der_pkcs8(&blocks[0].1).unwrap();
+        let from_pem = PrivateKey::from_pem_blocks(&blocks).unwrap();
+
+        let digest = Hash::Sha256.digest(b"der entry");
+        let sig = from_der.sign(&digest).unwrap();
+        assert!(
+            from_pem
+                .public()
+                .verify(SigAlg::Rsa(Hash::Sha256), &digest, &sig)
         );
     }
 }

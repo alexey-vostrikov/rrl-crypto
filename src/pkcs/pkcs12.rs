@@ -34,6 +34,22 @@ pub enum Error {
     Malformed(String),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Named for what it is, and not "decryption failed": PBES2 has no MAC, so a wrong
+            // password and a damaged file are the same observation, and a message that picked one
+            // would send an operator looking in the wrong place.
+            Error::BadPassword => f.write_str(
+                "cannot decrypt: the password is wrong, or the encrypted data is damaged",
+            ),
+            Error::Malformed(why) => write!(f, "malformed: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 impl From<DerError> for Error {
     fn from(e: DerError) -> Self {
         Error::Malformed(e.0)
@@ -714,6 +730,20 @@ fn key_bag(id: &[u8], value: &[u8], password: Option<&str>) -> Result<Option<Pri
     let key = PrivateKey::from_pem_blocks(&[("PRIVATE KEY".into(), pkcs8)])
         .map_err(|_| Error::BadPassword)?;
     Ok(Some(key))
+}
+
+/// The `PrivateKeyInfo` inside an `EncryptedPrivateKeyInfo`, decrypted.
+///
+/// The same structure PKCS #12 wraps in a shrouded key bag, and the one an `ENCRYPTED PRIVATE KEY`
+/// PEM block carries - which is what `openssl genpkey -aes-256-cbc` writes, and what an mTLS
+/// deployment hands a service. One parser for both, because a second one would be a second opinion
+/// about PBES2 parameters and about whether a wrong password is an error or a shorter key.
+///
+/// A wrong password fails the same way a corrupted file does: `BadPassword`. The distinction is not
+/// available to a parser - PBES2 authenticates nothing - and claiming one would be a lie a caller
+/// might act on.
+pub fn decrypt_private_key_info(der: &[u8], password: &str) -> Result<Vec<u8>> {
+    shrouded_key(der, Some(password))
 }
 
 /// `EncryptedPrivateKeyInfo ::= SEQUENCE { AlgorithmIdentifier, OCTET STRING }`.
